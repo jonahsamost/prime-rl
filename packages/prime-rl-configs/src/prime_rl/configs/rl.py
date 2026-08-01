@@ -129,6 +129,11 @@ class SharedInMemoryWeightBroadcastConfig(BaseConfig):
     """Timeout in seconds for in-memory weight transfer."""
 
 
+class SharedWeightSyncProfilingConfig(BaseConfig):
+    sample_interval_ms: float = Field(5.0, gt=0)
+    """Interval for sampling GPU, pinned-host, and process memory during weight synchronization."""
+
+
 class SharedNCCLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
     type: Literal["nccl"] = "nccl"
 
@@ -137,6 +142,18 @@ class SharedNCCLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
 
     quantize_in_weight_transfer: bool = False
     """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
+
+    delta_mode: Literal["none", "bf16_xor"] = "none"
+    """Experimental GPU nvCOMP LZ4 BF16 XOR updates over NCCL."""
+
+    delta_adam_bucket_mb: int = Field(256, ge=1)
+    """Maximum local parameter MiB updated by each batched AdamW call.
+
+    An individually larger parameter stands alone.
+    """
+
+    profiling: SharedWeightSyncProfilingConfig | None = None
+    """Opt-in detailed timing and memory profiling for full and delta weight updates."""
 
 
 class SharedNIXLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
@@ -349,6 +366,37 @@ class RLConfig(BaseConfig):
 
         return self
 
+    @model_validator(mode="after")
+    def validate_bf16_xor_weight_transfer(self):
+        if not isinstance(self.weight_broadcast, SharedNCCLWeightBroadcastConfig):
+            return self
+        if self.weight_broadcast.delta_mode == "none":
+            return self
+        if self.weight_broadcast.quantize_in_weight_transfer:
+            raise ValueError("weight_broadcast.delta_mode='bf16_xor' is incompatible with quantized transfer.")
+        if self.inference is None:
+            raise ValueError("weight_broadcast.delta_mode='bf16_xor' requires an inference config.")
+        if self.model is None or self.model.name != "Qwen/Qwen3-0.6B-Base":
+            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently supports only Qwen/Qwen3-0.6B-Base.")
+        if self.trainer.optim.type != "adamw":
+            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently requires trainer.optim.type='adamw'.")
+        if self.trainer.max_concurrent_runs != 1:
+            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently requires max_concurrent_runs=1.")
+        if self.trainer.model.optimization_dtype != "bfloat16":
+            raise ValueError(
+                "weight_broadcast.delta_mode='bf16_xor' requires trainer.model.optimization_dtype='bfloat16'."
+            )
+        if self.trainer.model.quantization is not None or self.inference.quantization is not None:
+            raise ValueError("weight_broadcast.delta_mode='bf16_xor' does not support quantized models.")
+        if self.inference.parallel.tp != 1:
+            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently requires inference.parallel.tp=1.")
+        if self.deployment.type != "single_node" or self.deployment.num_train_gpus != 1:
+            raise ValueError(
+                "weight_broadcast.delta_mode='bf16_xor' currently requires a single-node deployment with "
+                "deployment.num_train_gpus=1."
+            )
+        return self
+
     ### Auto-setup shared configs (before sub-config construction)
 
     @model_validator(mode="before")
@@ -403,6 +451,13 @@ class RLConfig(BaseConfig):
             if self.weight_broadcast.type == "nccl":
                 transport_config = dict(
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
+                    delta_mode=self.weight_broadcast.delta_mode,
+                    delta_adam_bucket_mb=self.weight_broadcast.delta_adam_bucket_mb,
+                    profiling=(
+                        self.weight_broadcast.profiling.model_dump()
+                        if self.weight_broadcast.profiling is not None
+                        else None
+                    ),
                 )
                 trainer_config_type = TrainerNCCLWeightBroadcastConfig
                 orchestrator_config_type = OrchestratorNCCLWeightBroadcastConfig

@@ -9,6 +9,7 @@ from datetime import timedelta
 
 from prime_rl.trainer.models.layers.attn import substitute_ring_attn
 from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
+from prime_rl.trainer.rl.broadcast.nccl import NCCLWeightBroadcast
 from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 import torch.distributed as dist
@@ -57,6 +58,8 @@ from prime_rl.trainer.utils import (
     setup_torch_distributed,
     print_benchmark,
 )
+from prime_rl.weight_sync.bf16_delta import BF16DeltaUpdate
+from prime_rl.weight_sync.profiling import PhaseProfiler, cuda_event_pair, elapsed_cuda_ms
 from prime_rl.trainer.world import get_world
 from prime_rl.trainer.runs import setup_multi_run_manager, Progress, get_multi_run_manager
 from prime_rl.trainer.models.layers.lora import set_lora_num_tokens
@@ -171,6 +174,15 @@ def train(config: TrainerConfig):
             parallel_dims,
             lora=config.model.lora is not None,
             cpu_offload=config.model.optim_cpu_offload,
+            delta_mode=(config.weight_broadcast.delta_mode if config.weight_broadcast.type == "nccl" else "none"),
+            profiling_sample_interval_ms=(
+                config.weight_broadcast.profiling.sample_interval_ms
+                if config.weight_broadcast.type == "nccl" and config.weight_broadcast.profiling is not None
+                else None
+            ),
+            delta_adam_bucket_mb=(
+                config.weight_broadcast.delta_adam_bucket_mb if config.weight_broadcast.type == "nccl" else 256
+            ),
         )
         scheduler = setup_scheduler(optimizer, config.scheduler, config.max_steps, config.optim.lr)
     else:
@@ -197,6 +209,23 @@ def train(config: TrainerConfig):
             parallel_dims,
             config.model.lora,
         )
+    delta_optimizer = (
+        optimizer
+        if weight_broadcast is not None
+        and config.weight_broadcast.type == "nccl"
+        and config.weight_broadcast.delta_mode == "bf16_xor"
+        else None
+    )
+    profile_weight_sync = config.weight_broadcast.type == "nccl" and config.weight_broadcast.profiling is not None
+    optimizer_profiler = PhaseProfiler(
+        enabled=profile_weight_sync,
+        device=torch.device("cuda", torch.cuda.current_device()),
+        sample_interval_ms=(
+            config.weight_broadcast.profiling.sample_interval_ms
+            if profile_weight_sync and config.weight_broadcast.profiling is not None
+            else 5.0
+        ),
+    )
 
     if parallel_dims.cp_enabled:
         cp_group = parallel_dims.world_mesh["cp"].get_group()
@@ -578,8 +607,32 @@ def train(config: TrainerConfig):
 
         zero_grad_ratio = get_zero_gradient_ratio(model.parameters(), parallel_dims.dp_replicate)
 
-        # Update the model parameters
-        optimizer.step()
+        # The delta-aware AdamW bounds snapshots by update bucket and releases
+        # each bucket after nvCOMP has consumed its GPU-resident parameter XORs.
+        delta_update: BF16DeltaUpdate | None = None
+        record_delta = delta_optimizer is not None and not (
+            config.max_steps is not None and progress.step >= config.max_steps - 1
+        )
+        if record_delta:
+            delta_optimizer.begin_delta(base_step=progress.step - 1, step=progress.step)
+        with optimizer_profiler.measure("optimizer_step") as optimizer_phase:
+            optimizer_events = cuda_event_pair() if profile_weight_sync else None
+            if optimizer_events is not None:
+                optimizer_events[0].record()
+            optimizer.step()
+            optimizer_step_gpu_ms = 0.0
+            if optimizer_events is not None:
+                optimizer_events[1].record()
+                optimizer_step_gpu_ms = elapsed_cuda_ms(optimizer_events)
+        # The phase profiler synchronizes at exit, so this is end-to-end optimizer
+        # latency rather than only the time Python spent enqueueing CUDA work.
+        optimizer_step_wall_ms = optimizer_phase.wall_ms
+        if record_delta:
+            delta_update = delta_optimizer.take_delta_update()
+            if delta_update is not None and delta_update.profile is not None:
+                delta_update.profile.optimizer_step_wall_ms = optimizer_step_wall_ms
+                delta_update.profile.optimizer_step_gpu_ms = optimizer_step_gpu_ms
+                delta_update.profile.phases[optimizer_phase.name] = optimizer_phase
         optimizer.zero_grad()
 
         # Update learning rate scheduler
@@ -594,6 +647,13 @@ def train(config: TrainerConfig):
         # Broadcast the model just produced (policy v{progress.step}) so the orchestrator can
         # sample its next step from it. In-memory transports retain their two-step shutdown
         # window; filesystem broadcast still writes every version for resume.
+        weight_sync_metrics: dict[str, float] = {}
+        if profile_weight_sync:
+            weight_sync_metrics = {
+                "weight_sync/optimizer_step_wall_ms": optimizer_step_wall_ms,
+                "weight_sync/optimizer_step_gpu_ms": optimizer_step_gpu_ms,
+            }
+            weight_sync_metrics.update(optimizer_phase.flat_metrics())
         if weight_broadcast is None:
             broadcast_weights_time = 0
         else:
@@ -604,8 +664,26 @@ def train(config: TrainerConfig):
             )
             if not broadcast_unused:
                 broadcast_weights_start_time = time.perf_counter()
-                weight_broadcast.broadcast_weights(model, step=progress.step)
+                if isinstance(weight_broadcast, NCCLWeightBroadcast) and profile_weight_sync:
+                    weight_broadcast.nccl_broadcast_sender.set_optimizer_step_profile(
+                        wall_ms=optimizer_step_wall_ms,
+                        gpu_ms=optimizer_step_gpu_ms,
+                        phase=optimizer_phase,
+                    )
+                if delta_update is not None:
+                    assert isinstance(weight_broadcast, NCCLWeightBroadcast)
+                    weight_broadcast.broadcast_weights(model, step=progress.step, delta_update=delta_update)
+                    delta_update = None
+                else:
+                    weight_broadcast.broadcast_weights(model, step=progress.step)
                 broadcast_weights_time = time.perf_counter() - broadcast_weights_start_time
+                if isinstance(weight_broadcast, NCCLWeightBroadcast):
+                    broadcast_profile = weight_broadcast.nccl_broadcast_sender.last_profile
+                    if broadcast_profile is not None:
+                        if broadcast_profile.optimizer_step_wall_ms == 0:
+                            broadcast_profile.optimizer_step_wall_ms = optimizer_step_wall_ms
+                            broadcast_profile.optimizer_step_gpu_ms = optimizer_step_gpu_ms
+                        weight_sync_metrics.update(broadcast_profile.flat_metrics())
                 # Clean up old broadcast directories (unless at ckpt interval if using filesystem weight broadcast)
                 if config.weight_broadcast.type == "filesystem":
                     interval_to_keep = config.ckpt and config.ckpt.interval
@@ -722,6 +800,7 @@ def train(config: TrainerConfig):
             "time/forward_backward": forward_backward_time,
             "step": progress.step,
         }
+        time_metrics.update(weight_sync_metrics)
         monitor.log(time_metrics, step=progress.step)
 
         # Log disk metrics

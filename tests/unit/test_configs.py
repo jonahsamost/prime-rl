@@ -540,6 +540,52 @@ def test_shared_and_subconfig_disjoint_fields_coexist():
     assert config.trainer.model.impl == "custom"
 
 
+def test_bf16_xor_weight_transfer_propagates_to_nccl_components():
+    config = RLConfig.model_validate(
+        {
+            "model": {"name": "Qwen/Qwen3-0.6B-Base"},
+            "weight_broadcast": {
+                "type": "nccl",
+                "delta_mode": "bf16_xor",
+                "delta_adam_bucket_mb": 192,
+                "profiling": {"sample_interval_ms": 2.5},
+            },
+            "trainer": {"model": {"optimization_dtype": "bfloat16"}},
+            "orchestrator": {"renderer": {"name": "default"}},
+            "inference": {"parallel": {"tp": 1}},
+        }
+    )
+
+    assert config.trainer.weight_broadcast.type == "nccl"
+    assert config.trainer.weight_broadcast.delta_mode == "bf16_xor"
+    assert config.trainer.weight_broadcast.delta_adam_bucket_mb == 192
+    assert config.trainer.weight_broadcast.profiling is not None
+    assert config.trainer.weight_broadcast.profiling.sample_interval_ms == 2.5
+    assert config.orchestrator.weight_broadcast.type == "nccl"
+    assert config.orchestrator.weight_broadcast.delta_mode == "bf16_xor"
+    assert config.orchestrator.weight_broadcast.delta_adam_bucket_mb == 192
+    assert config.orchestrator.weight_broadcast.profiling is not None
+    assert config.orchestrator.weight_broadcast.profiling.sample_interval_ms == 2.5
+
+
+def test_bf16_xor_weight_transfer_rejects_quantization():
+    with pytest.raises(ValidationError, match="does not support quantized models"):
+        RLConfig.model_validate(
+            {
+                "model": {"name": "Qwen/Qwen3-0.6B-Base"},
+                "weight_broadcast": {"type": "nccl", "delta_mode": "bf16_xor"},
+                "trainer": {
+                    "model": {
+                        "optimization_dtype": "bfloat16",
+                        "quantization": {"type": "fp8"},
+                    }
+                },
+                "orchestrator": {"renderer": {"name": "default"}},
+                "inference": {"parallel": {"tp": 1}},
+            }
+        )
+
+
 def test_shared_output_dir_propagates_through_cli(tmp_path):
     """Shared output_dir from CLI reaches sub-configs even when tyro constructs sub-configs before the before-validator."""
     toml_path = tmp_path / "cfg.toml"

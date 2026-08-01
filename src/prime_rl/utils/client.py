@@ -437,7 +437,7 @@ async def update_weights(
                     _admin_post(
                         admin_client,
                         "/update_weights",
-                        json={"weight_dir": weight_dir_posix},
+                        json={"weight_dir": weight_dir_posix, "step": step},
                         timeout_s=UPDATE_WEIGHTS_TIMEOUT_S,
                     )
                     for admin_client in admin_clients
@@ -522,6 +522,8 @@ async def init_nccl_broadcast(
     timeout: int,
     inference_world_size: int | None = None,
     quantize_in_weight_transfer: bool = False,
+    delta_mode: str = "none",
+    profiling_sample_interval_ms: float | None = None,
 ) -> None:
     """Initialize NCCL broadcast on all inference servers.
 
@@ -555,6 +557,8 @@ async def init_nccl_broadcast(
                     "inference_world_size": inference_world_size,
                     "timeout": timeout,
                     "quantize_in_weight_transfer": quantize_in_weight_transfer,
+                    "delta_mode": delta_mode,
+                    "profiling_sample_interval_ms": profiling_sample_interval_ms,
                 },
             )
             response.raise_for_status()

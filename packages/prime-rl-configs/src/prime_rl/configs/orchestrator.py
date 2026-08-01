@@ -418,6 +418,11 @@ class InMemoryWeightBroadcastConfig(BaseConfig):
     """Total inference workers across all servers."""
 
 
+class WeightSyncProfilingConfig(BaseConfig):
+    sample_interval_ms: float = Field(5.0, gt=0)
+    """Interval for sampling GPU, pinned-host, and process memory during weight synchronization."""
+
+
 class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     type: Literal["nccl"] = "nccl"
 
@@ -426,6 +431,18 @@ class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
 
     quantize_in_weight_transfer: bool = False
     """Use kernel-format FP8 quantized NCCL transfer for weight updates."""
+
+    delta_mode: Literal["none", "bf16_xor"] = "none"
+    """Experimental GPU nvCOMP LZ4 BF16 XOR update protocol."""
+
+    delta_adam_bucket_mb: int = Field(256, ge=1)
+    """Maximum local parameter MiB updated by each batched AdamW call.
+
+    An individually larger parameter stands alone.
+    """
+
+    profiling: WeightSyncProfilingConfig | None = None
+    """Opt-in detailed timing and memory profiling for full and delta weight updates."""
 
 
 class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):

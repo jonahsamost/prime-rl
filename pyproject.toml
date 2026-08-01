@@ -45,6 +45,7 @@ dependencies = [
     "msgspec>=0.18",
     "torchao>=0.17.0",
     "modelexpress==0.3.0",
+    "nvidia-nvcomp-cu12; sys_platform == 'linux'",
 ]
 
 [project.scripts]

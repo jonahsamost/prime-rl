@@ -23,15 +23,107 @@ from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
 from prime_rl.utils.pathing import sync_wait_for_path
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 from prime_rl.utils.vlm import get_layer_prefix
+from prime_rl.weight_sync.bf16_delta import (
+    BF16DeltaUpdate,
+    WeightUpdateHeader,
+    WeightUpdateKind,
+    encode_weight_update_header,
+)
+from prime_rl.weight_sync.profiling import (
+    PhaseProfile,
+    PhaseProfiler,
+    WeightSyncMetrics,
+    cuda_event_pair,
+    elapsed_cuda_ms,
+)
 
 
-def broadcast_integer(integer: int, communicator: PyNcclCommunicator) -> None:
+def broadcast_integer(
+    integer: int,
+    communicator: PyNcclCommunicator,
+    profile: WeightSyncMetrics | None = None,
+) -> None:
     """Broadcast an integer to a process group using NCCL communicator."""
     integer_tensor = torch.tensor([integer], dtype=torch.long).cuda()
-    communicator.broadcast(integer_tensor, src=0)
+    _broadcast_tensor(integer_tensor, communicator, profile)
 
 
-def broadcast_state_dict(state_dict: dict[str, Tensor], communicator: PyNcclCommunicator) -> None:
+def broadcast_update_header(
+    header: WeightUpdateHeader,
+    communicator: PyNcclCommunicator,
+    profile: WeightSyncMetrics | None = None,
+) -> None:
+    values = encode_weight_update_header(header, device=communicator.device)
+    _broadcast_tensor(values, communicator, profile)
+
+
+def _broadcast_tensor(
+    tensor: Tensor,
+    communicator: PyNcclCommunicator,
+    profile: WeightSyncMetrics | None,
+) -> None:
+    if profile is not None:
+        profile.wire_bytes += tensor.numel() * tensor.element_size()
+        profile.nccl_call_count += 1
+    events = cuda_event_pair() if profile is not None else None
+    if events is not None:
+        events[0].record()
+    communicator.broadcast(tensor, src=0)
+    if events is not None:
+        events[1].record()
+        profile.sender_nccl_ms += elapsed_cuda_ms(events)
+
+
+def _stage_bytes(
+    payload: bytes,
+    communicator: PyNcclCommunicator,
+    profile: WeightSyncMetrics | None,
+) -> Tensor:
+    events = cuda_event_pair() if profile is not None else None
+    if events is not None:
+        events[0].record()
+    values = torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(communicator.device)
+    if events is not None:
+        events[1].record()
+        profile.sender_stage_h2d_ms += elapsed_cuda_ms(events)
+    return values
+
+
+def broadcast_bytes(
+    payload: bytes,
+    communicator: PyNcclCommunicator,
+    profile: WeightSyncMetrics | None = None,
+) -> None:
+    size = torch.tensor([len(payload)], dtype=torch.long, device=communicator.device)
+    _broadcast_tensor(size, communicator, profile)
+    values = _stage_bytes(payload, communicator, profile)
+    _broadcast_tensor(values, communicator, profile)
+
+
+def broadcast_compressed_delta(
+    update: BF16DeltaUpdate,
+    communicator: PyNcclCommunicator,
+    profile: WeightSyncMetrics | None = None,
+) -> None:
+    metadata = pickle.dumps(
+        (
+            update.tensors,
+            tuple((frame.uncompressed_nbytes, frame.compressed_nbytes) for frame in update.frames),
+        )
+    )
+    broadcast_bytes(metadata, communicator, profile)
+    if update.payload.device != communicator.device:
+        raise ValueError(
+            f"BF16 delta payload is on {update.payload.device}; NCCL communicator uses {communicator.device}"
+        )
+    _broadcast_tensor(update.payload, communicator, profile)
+
+
+def broadcast_state_dict(
+    state_dict: dict[str, Tensor],
+    communicator: PyNcclCommunicator,
+    profile: WeightSyncMetrics | None = None,
+) -> None:
     """Broadcast a state dict to NCCL process group using the PyNcclCommunicator."""
     # Group tensors by dtype
     dtype_groups: dict[torch.dtype, list[tuple[str, Tensor]]] = {}
@@ -43,6 +135,12 @@ def broadcast_state_dict(state_dict: dict[str, Tensor], communicator: PyNcclComm
         if dtype not in dtype_groups:
             dtype_groups[dtype] = []
         dtype_groups[dtype].append((key, value))
+        if profile is not None:
+            nbytes = value.numel() * value.element_size()
+            profile.raw_bytes += nbytes
+            profile.compressed_bytes += nbytes
+            profile.tensor_count += 1
+            profile.largest_tensor_bytes = max(profile.largest_tensor_bytes, nbytes)
 
     # Build metadata: for each dtype group, store keys and shapes
     metadata = {}
@@ -52,16 +150,24 @@ def broadcast_state_dict(state_dict: dict[str, Tensor], communicator: PyNcclComm
     # Send metadata
     state = pickle.dumps(metadata)
     size_tensor = torch.tensor([len(state)], dtype=torch.long).cuda()
-    communicator.broadcast(size_tensor, src=0)
-    state_tensor = torch.ByteTensor(list(state)).cuda()
-    communicator.broadcast(state_tensor, src=0)
+    _broadcast_tensor(size_tensor, communicator, profile)
+    state_tensor = _stage_bytes(state, communicator, profile)
+    _broadcast_tensor(state_tensor, communicator, profile)
 
     # Concatenate and broadcast tensors grouped by dtype
     for dtype, items in dtype_groups.items():
         # Flatten all tensors and concatenate
         flat_tensors = [value.flatten() for _, value in items]
+        pack_events = cuda_event_pair() if profile is not None else None
+        if pack_events is not None:
+            pack_events[0].record()
         concatenated = torch.cat(flat_tensors)
-        communicator.broadcast(concatenated, src=0)
+        if pack_events is not None:
+            pack_events[1].record()
+            profile.full_pack_ms += elapsed_cuda_ms(pack_events)
+        _broadcast_tensor(concatenated, communicator, profile)
+        if profile is not None:
+            profile.frame_count += 1
         del concatenated
         # Clean up individual tensors
         for _, value in items:
@@ -120,11 +226,19 @@ class NCCLWeightBroadcastSender:
         timeout: int,
         dtype: torch.dtype = torch.bfloat16,
         quantize_in_weight_transfer: bool = False,
+        delta_mode: str = "none",
+        profiling_sample_interval_ms: float | None = None,
     ):
         self.logger = get_logger()
         self.world = get_world()
         self.dtype = dtype
         self.quantize_in_weight_transfer = quantize_in_weight_transfer
+        self.delta_mode = delta_mode
+        self.last_broadcast_step: int | None = None
+        self.last_profile: WeightSyncMetrics | None = None
+        self._optimizer_step_profile: tuple[float, float, PhaseProfile] | None = None
+        if self.delta_mode != "none" and self.quantize_in_weight_transfer:
+            raise ValueError("BF16 XOR delta mode is incompatible with quantize_in_weight_transfer")
 
         if self.world.is_master:
             disable_nccl_p2p_if_unavailable()
@@ -136,17 +250,80 @@ class NCCLWeightBroadcastSender:
             self.logger.debug("NCCL broadcast initialized on master rank")
         else:
             self.logger.debug("NCCL broadcast initialized on non-master rank (no communicator)")
+        self.profiler = PhaseProfiler(
+            enabled=profiling_sample_interval_ms is not None,
+            device=device,
+            sample_interval_ms=profiling_sample_interval_ms or 5.0,
+        )
 
     @torch.no_grad()
-    def broadcast_weights(self, model: nn.Module, step: int) -> None:
+    def broadcast_weights(
+        self,
+        model: nn.Module,
+        step: int,
+        delta_update: BF16DeltaUpdate | None = None,
+    ) -> None:
         """Broadcast the state dict of a model into the inference pool using NCCL."""
-        state_dict = model.state_dict()
+        profile = delta_update.profile if delta_update is not None else None
+        if self.profiler.enabled and profile is None:
+            profile = WeightSyncMetrics()
+        phase_name = "delta_send" if delta_update is not None else "full_send"
+        with self.profiler.measure(phase_name) as phase:
+            self._broadcast_weights(model, step, delta_update, profile)
+        if profile is not None:
+            if self._optimizer_step_profile is not None:
+                wall_ms, gpu_ms, optimizer_phase = self._optimizer_step_profile
+                profile.optimizer_step_wall_ms = wall_ms
+                profile.optimizer_step_gpu_ms = gpu_ms
+                profile.phases[optimizer_phase.name] = optimizer_phase
+                self._optimizer_step_profile = None
+            profile.phases[phase.name] = phase
+            self.last_profile = profile
+            self.logger.info(profile.structured_log(event="weight_sync_profile", step=step, role="trainer"))
+
+    def set_optimizer_step_profile(self, *, wall_ms: float, gpu_ms: float, phase: PhaseProfile) -> None:
+        self._optimizer_step_profile = (wall_ms, gpu_ms, phase)
+
+    def _broadcast_weights(
+        self,
+        model: nn.Module,
+        step: int,
+        delta_update: BF16DeltaUpdate | None,
+        profile: WeightSyncMetrics | None,
+    ) -> None:
+        is_delta_update = delta_update is not None
+        if delta_update is not None:
+            if self.delta_mode != "bf16_xor":
+                raise ValueError("received a BF16 delta update while delta mode is disabled")
+            if delta_update.step != step:
+                raise ValueError(f"delta step {delta_update.step} does not match broadcast step {step}")
+            if delta_update.base_step != self.last_broadcast_step:
+                raise ValueError(
+                    f"delta base step {delta_update.base_step} does not match last broadcast {self.last_broadcast_step}"
+                )
+            if getattr(model.config, "model_type", None) != "qwen3":
+                raise ValueError("BF16 XOR delta broadcast currently supports Qwen3 only")
+            header = WeightUpdateHeader(WeightUpdateKind.BF16_XOR, delta_update.base_step, step)
+        else:
+            header = WeightUpdateHeader(WeightUpdateKind.FULL, -1, step)
+            state_dict = model.state_dict()
+
+        if self.world.is_master and self.delta_mode != "none":
+            broadcast_update_header(header, self.communicator, profile)
+
+        if is_delta_update:
+            assert delta_update is not None
+            if self.world.is_master:
+                broadcast_compressed_delta(delta_update, self.communicator, profile)
+            self.last_broadcast_step = step
+            return
+
         layer_prefix = get_layer_prefix(model.config)
         num_layers = get_max_layer_num(state_dict, layer_prefix)
         num_state_dict_to_send = num_layers + 1  # we send all layer plus the remaining weights
 
         if self.world.is_master:
-            broadcast_integer(num_state_dict_to_send, self.communicator)
+            broadcast_integer(num_state_dict_to_send, self.communicator, profile)
 
         self.logger.debug(f"Broadcasting {num_state_dict_to_send} layer state dicts")
         preprocess_fn: Callable[[nn.Module, dict[str, Tensor], int], dict[str, Tensor]]
@@ -159,7 +336,8 @@ class NCCLWeightBroadcastSender:
             layer_state_dict = self._resolve_dtensors(layer_state_dict)
             layer_state_dict = preprocess_fn(model, layer_state_dict, layer_id)
             if self.world.is_master:
-                broadcast_state_dict(layer_state_dict, self.communicator)
+                broadcast_state_dict(layer_state_dict, self.communicator, profile)
+        self.last_broadcast_step = step
 
     def _resolve_dtensors(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
         for key, value in list(state_dict.items()):
@@ -191,10 +369,19 @@ class NCCLWeightBroadcast(WeightBroadcast):
             config.timeout,
             dtype,
             quantize_in_weight_transfer=config.quantize_in_weight_transfer,
+            delta_mode=config.delta_mode,
+            profiling_sample_interval_ms=(
+                config.profiling.sample_interval_ms if config.profiling is not None else None
+            ),
         )
 
     @torch.no_grad()
-    def broadcast_weights(self, model: nn.Module, step: int) -> None:
+    def broadcast_weights(
+        self,
+        model: nn.Module,
+        step: int,
+        delta_update: BF16DeltaUpdate | None = None,
+    ) -> None:
         """Broadcast the state dict of a model into the inference pool using NCCL and notifies the orchestrator."""
         self.logger.debug("Starting broadcasting weights to inference engine via NCCL")
         start_time = time.perf_counter()
@@ -212,7 +399,7 @@ class NCCLWeightBroadcast(WeightBroadcast):
             self._wait_for_nccl_ready(notified_runs)
         if self.world.world_size > 1:
             dist.barrier()
-        self.nccl_broadcast_sender.broadcast_weights(model, step)
+        self.nccl_broadcast_sender.broadcast_weights(model, step, delta_update)
         self.logger.debug(f"Weights broadcasted in {time.perf_counter() - start_time:.2f}s")
 
     def _compute_notified_runs(self) -> list[tuple[int, Path]]:
