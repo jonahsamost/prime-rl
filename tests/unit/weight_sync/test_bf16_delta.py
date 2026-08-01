@@ -43,6 +43,7 @@ def test_nvcomp_lz4_cuda_encode_decode_round_trip_is_byte_exact():
     new = torch.randint(-(2**15), 2**15, (1024, 1024), dtype=torch.int16, device=device, generator=generator)
     delta = torch.bitwise_xor(old, new).view(torch.bfloat16)
     second_delta = torch.bitwise_xor(old[:256], new[:256]).view(torch.bfloat16)
+    third_delta = torch.bitwise_xor(old[256:384], new[256:384]).view(torch.bfloat16)
     profile = WeightSyncMetrics()
     encoder = BF16DeltaEncoder(
         base_step=4,
@@ -52,6 +53,7 @@ def test_nvcomp_lz4_cuda_encode_decode_round_trip_is_byte_exact():
     )
 
     encoder.append_batch([("weight", delta), ("second_weight", second_delta)])
+    encoder.append("third_weight", third_delta)
     update = encoder.finish()
     decoded = _decode_update(update)
 
@@ -59,14 +61,25 @@ def test_nvcomp_lz4_cuda_encode_decode_round_trip_is_byte_exact():
     assert update.step == 5
     assert update.payload.device == device
     assert update.payload.dtype == torch.uint8
+    assert len(update.tensors) == 3
+    assert len(update.frames) == 2
+    assert update.frames[0].first_tensor_index == 0
+    assert update.frames[0].tensor_count == 2
+    assert update.frames[1].first_tensor_index == 2
+    assert update.frames[1].tensor_count == 1
     assert update.payload.numel() == packed_delta_nbytes(update.frames)
     assert all(payload.data_ptr() % 256 == 0 for payload in update.frame_payloads())
-    assert profile.raw_bytes == (delta.numel() + second_delta.numel()) * delta.element_size()
+    assert profile.raw_bytes == (delta.numel() + second_delta.numel() + third_delta.numel()) * delta.element_size()
     assert profile.compressed_bytes == update.compressed_nbytes
-    assert profile.nvcomp_batch_count == 1
+    assert profile.nvcomp_batch_count == 2
+    assert profile.nvcomp_peak_pending_batches == 2
+    assert profile.frame_count == 2
     assert profile.nvcomp_compress_gpu_ms > 0
     assert profile.nvcomp_encode_gpu_ms > 0
     assert profile.nvcomp_clone_gpu_ms > 0
+    assert profile.nvcomp_compress_gpu_ms == pytest.approx(
+        profile.nvcomp_encode_gpu_ms + profile.nvcomp_clone_gpu_ms
+    )
     assert profile.nvcomp_compress_wall_ms > 0
     assert profile.nvcomp_output_alloc_wall_ms > 0
     assert profile.nvcomp_encode_call_wall_ms > 0
@@ -74,6 +87,7 @@ def test_nvcomp_lz4_cuda_encode_decode_round_trip_is_byte_exact():
     assert profile.nvcomp_clone_enqueue_wall_ms > 0
     assert torch.equal(_bits(decoded["weight"]), _bits(delta))
     assert torch.equal(_bits(decoded["second_weight"]), _bits(second_delta))
+    assert torch.equal(_bits(decoded["third_weight"]), _bits(third_delta))
     assert torch.equal(torch.bitwise_xor(old, _bits(decoded["weight"])), new)
 
 
@@ -99,7 +113,7 @@ def test_delta_adamw_matches_adamw_and_emits_exact_parameter_xor():
         params=wrapped_named_parameters,
         lr=1e-3,
         weight_decay=0.1,
-        delta_adam_bucket_bytes=128,
+        delta_adam_bucket_bytes=1024 * 1024,
     )
 
     old_state = {name: value.clone() for name, value in delta_model.state_dict().items()}
@@ -114,6 +128,8 @@ def test_delta_adamw_matches_adamw_and_emits_exact_parameter_xor():
     update = delta_optimizer.take_delta_update()
 
     assert update is not None
+    assert len(update.frames) == 1
+    assert update.frames[0].tensor_count == len(old_state)
     decoded = _decode_update(update)
     assert decoded.keys() == old_state.keys()
     for (name, delta_parameter), reference_parameter in zip(

@@ -108,7 +108,15 @@ def broadcast_compressed_delta(
     metadata = pickle.dumps(
         (
             update.tensors,
-            tuple((frame.uncompressed_nbytes, frame.compressed_nbytes) for frame in update.frames),
+            tuple(
+                (
+                    frame.first_tensor_index,
+                    frame.tensor_count,
+                    frame.uncompressed_nbytes,
+                    frame.compressed_nbytes,
+                )
+                for frame in update.frames
+            ),
         )
     )
     broadcast_bytes(metadata, communicator, profile)

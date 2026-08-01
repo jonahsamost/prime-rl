@@ -114,10 +114,12 @@ def receive_compressed_delta(
         raise RuntimeError("invalid BF16 delta tensor metadata")
     frames = tuple(
         CompressedDeltaFrame(
+            first_tensor_index=first_tensor_index,
+            tensor_count=tensor_count,
             uncompressed_nbytes=uncompressed_nbytes,
             compressed_nbytes=compressed_nbytes,
         )
-        for uncompressed_nbytes, compressed_nbytes in frame_sizes
+        for first_tensor_index, tensor_count, uncompressed_nbytes, compressed_nbytes in frame_sizes
     )
     payload = torch.empty(
         packed_delta_nbytes(frames),
@@ -324,8 +326,10 @@ class NCCLWeightUpdateWorker(Worker):
                     profile.frame_count = len(update.frames)
                     profile.largest_tensor_bytes = max(item.nbytes for item in update.tensors)
                 logger.info(
-                    "Received nvCOMP LZ4 BF16 XOR update: %d tensors, %.2f MiB compressed from %.2f MiB (%.1fx)",
+                    "Received nvCOMP LZ4 BF16 XOR update: %d tensors in %d frames, "
+                    "%.2f MiB compressed from %.2f MiB (%.1fx)",
                     len(update.tensors),
+                    len(update.frames),
                     update.compressed_nbytes / (1024 * 1024),
                     update.uncompressed_nbytes / (1024 * 1024),
                     update.uncompressed_nbytes / update.compressed_nbytes,
@@ -335,31 +339,29 @@ class NCCLWeightUpdateWorker(Worker):
                 assert codec is not None
                 frame_payloads = list(update.frame_payloads())
                 decode_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
-                group_start = 0
-                while group_start < len(update.tensors):
-                    layer_index = qwen_layer_index(update.tensors[group_start].name)
-                    group_end = group_start + 1
-                    while (
-                        group_end < len(update.tensors)
-                        and qwen_layer_index(update.tensors[group_end].name) == layer_index
-                    ):
-                        group_end += 1
+                for frame, frame_payload in zip(update.frames, frame_payloads, strict=True):
                     decoded, events = decode_delta_tensors(
                         codec,
-                        update.tensors[group_start:group_end],
-                        update.frames[group_start:group_end],
-                        frame_payloads[group_start:group_end],
+                        update.tensors,
+                        [frame],
+                        [frame_payload],
                         profile=profile is not None,
-                    )
-                    apply_qwen3_bf16_source_deltas_(
-                        model,
-                        dict(decoded),
-                        layer_index=layer_index,
-                        profile=profile,
                     )
                     if events is not None:
                         decode_events.append(events)
-                    group_start = group_end
+                    group_start = 0
+                    while group_start < len(decoded):
+                        layer_index = qwen_layer_index(decoded[group_start][0])
+                        group_end = group_start + 1
+                        while group_end < len(decoded) and qwen_layer_index(decoded[group_end][0]) == layer_index:
+                            group_end += 1
+                        apply_qwen3_bf16_source_deltas_(
+                            model,
+                            dict(decoded[group_start:group_end]),
+                            layer_index=layer_index,
+                            profile=profile,
+                        )
+                        group_start = group_end
                 torch.cuda.synchronize(self.device)
                 if profile is not None:
                     profile.nvcomp_decompress_gpu_ms += sum(start.elapsed_time(end) for start, end in decode_events)

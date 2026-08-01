@@ -143,7 +143,6 @@ class DeltaAdamW(AdamW):
                     ):
                         bucket_parameters = params_with_grad[bucket_start:bucket_end]
                         local_parameters: list[Tensor] = []
-                        old_values: list[Tensor] = []
 
                         snapshot_events = cuda_event_pair() if self._profiler.enabled else None
                         if snapshot_events is not None:
@@ -159,7 +158,20 @@ class DeltaAdamW(AdamW):
                             if not local_parameter.is_contiguous():
                                 raise ValueError(f"{name} is non-contiguous with stride {local_parameter.stride()}")
                             local_parameters.append(local_parameter)
-                            old_values.append(local_parameter.detach().clone())
+                        old_bucket = torch.empty(
+                            sum(parameter.numel() for parameter in local_parameters),
+                            dtype=torch.bfloat16,
+                            device=local_parameters[0].device,
+                        )
+                        old_values: list[Tensor] = []
+                        old_offset = 0
+                        for local_parameter in local_parameters:
+                            old_value = old_bucket.narrow(0, old_offset, local_parameter.numel()).view(
+                                local_parameter.shape
+                            )
+                            old_value.copy_(local_parameter)
+                            old_values.append(old_value)
+                            old_offset += local_parameter.numel()
                         if snapshot_events is not None:
                             snapshot_events[1].record()
                             snapshot_event_pairs.append(snapshot_events)
@@ -202,11 +214,12 @@ class DeltaAdamW(AdamW):
                         if xor_events is not None:
                             xor_events[1].record()
                             xor_event_pairs.append(xor_events)
-                        self._encoder.append_batch(
+                        self._encoder.append_bucket(
                             [
                                 (self._parameter_names[id(parameter)], old_value)
                                 for parameter, old_value in zip(bucket_parameters, old_values, strict=True)
-                            ]
+                            ],
+                            old_bucket,
                         )
                         if update_profile := self._encoder.profile:
                             update_profile.adam_bucket_count += 1
@@ -214,7 +227,7 @@ class DeltaAdamW(AdamW):
                                 update_profile.max_adam_bucket_bytes,
                                 bucket_bytes,
                             )
-                        del local_parameters, old_values
+                        del local_parameters, old_values, old_bucket
                 if self._encoder is not None:
                     update = self._encoder.finish()
                     self._encoder = None
