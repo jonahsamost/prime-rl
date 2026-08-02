@@ -3,24 +3,23 @@
 ## Implementation status
 
 The current experimental bring-up implements a versioned GPU nvCOMP LZ4
-`bf16_xor` NCCL path for `Qwen/Qwen3-0.6B-Base`, AdamW, BF16 trainer state,
-unquantized vLLM, and inference TP=1. A normal startup broadcast establishes
+`bf16_xor` NCCL path for dense Qwen3, AdamW, BF16 trainer state, FSDP `Shard(0)`
+(plus unsharded parameters), and unquantized vLLM tensor parallelism. A normal startup broadcast establishes
 the full baseline. Later consecutive steps use delta-aware AdamW to snapshot
-and update bounded 256 MiB local-parameter buckets, emit each parameter's exact
-source-layout XOR, and batch-compress the XOR tensors directly on GPU. The
-compressed CUDA streams are packed into one NCCL payload. The receiver keeps
-that payload on GPU and batch-decompresses bounded Qwen layer groups directly
-into CUDA source tensors before routing and in-place XOR application.
-The receiver decompresses the frames, routes their tensors layerwise through
-vLLM's loader, and applies them in place.
-The debug smoke config additionally enables an end-to-end SHA-256 audit for a
-small set of direct-layout Qwen parameters: the trainer hashes their exact
-post-Adam bytes and the receiver verifies the live vLLM bytes after the full
-compress/NCCL/decompress/route/XOR path.
+and update bounded local-parameter buckets, emit each rank's exact source-layout
+XOR shards, and compress those shards directly on GPU. Trainer rank 0 gathers
+only compressed frames and broadcasts the rank-indexed payloads. Each inference
+rank decompresses corresponding FSDP frames, reconstructs one complete source
+bucket at a time, routes it through vLLM's loader, and applies the local TP
+destination XOR in place.
 
 This is an experimental bounded-snapshot implementation whose GPU codec,
 compressed-payload retention, and layer decode scratch must be benchmarked
 before this mode can make a performance claim.
+
+FP8/quantized deltas, MoE expert-parallel layouts, replicated HSDP groups,
+direct FSDP-fragment-to-TP routing, and oversized-parameter splitting remain
+follow-up work.
 
 ## 1. Objective
 
@@ -95,9 +94,9 @@ Keep the first end-to-end implementation intentionally narrow:
 - Inference `model.dtype`: explicitly `bfloat16`, not `auto`.
 - Inference `quantization`: `None`.
 - `quantize_in_weight_transfer`: `false`.
-- Inference topology: TP=1 and PP=1 initially; DP replicas may receive the same update.
-- Trainer topology: one trainer rank for the first end-to-end proof; sharded DTensor delta aggregation is the next expansion.
-- Model: one audited dense architecture before adding MoE or model variants.
+- Inference topology: arbitrary vLLM TP degree for the audited dense Qwen3 loader; PP remains unsupported.
+- Trainer topology: `dp_replicate=1`, `cp=1`, `ep=1`, and FSDP `Shard(0)` degree one or greater.
+- Model: audited dense Qwen3 BF16 models; MoE Qwen3 variants remain unsupported.
 - Synchronization cadence: one published delta per optimizer step.
 - Delta storage: GPU by default, under a strict configurable byte budget.
 - Fallback: use the existing full NCCL broadcast if the encoded delta is too large, the buffer budget is exceeded, or any capability check fails before mutation.

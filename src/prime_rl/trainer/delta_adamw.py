@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 from torch import Tensor, nn
+from torch.distributed.tensor import DTensor, Replicate, Shard
 from torch.optim import AdamW
 from torch.optim.adam import adam
 from torch.optim.optimizer import _use_grad_for_differentiable
@@ -214,12 +215,15 @@ class DeltaAdamW(AdamW):
                         if xor_events is not None:
                             xor_events[1].record()
                             xor_event_pairs.append(xor_events)
-                        self._encoder.append_bucket(
+                        shard_descriptors = [_parameter_shard_descriptor(parameter) for parameter in bucket_parameters]
+                        self._encoder.append_sharded_bucket(
                             [
                                 (self._parameter_names[id(parameter)], old_value)
                                 for parameter, old_value in zip(bucket_parameters, old_values, strict=True)
                             ],
                             old_bucket,
+                            global_shapes=[descriptor[0] for descriptor in shard_descriptors],
+                            shard_descriptors=[descriptor[1:] for descriptor in shard_descriptors],
                         )
                         if update_profile := self._encoder.profile:
                             update_profile.adam_bucket_count += 1
@@ -276,6 +280,38 @@ def _parameter_buckets(
         used += parameter_bytes
     if start < len(parameters):
         yield start, len(parameters), used
+
+
+def _parameter_shard_descriptor(parameter: Tensor) -> tuple[tuple[int, ...], int | None, int, int]:
+    if not isinstance(parameter, DTensor):
+        return tuple(parameter.shape), None, 0, 1
+
+    shard_mesh_dims = [index for index, placement in enumerate(parameter.placements) if isinstance(placement, Shard)]
+    if not shard_mesh_dims:
+        return tuple(parameter.shape), None, 0, 1
+    if len(shard_mesh_dims) != 1:
+        raise ValueError(
+            f"BF16 delta FSDP mode requires exactly one sharded mesh dimension, got {parameter.placements}"
+        )
+    if any(
+        isinstance(placement, Replicate) and parameter.device_mesh.size(index) > 1
+        for index, placement in enumerate(parameter.placements)
+    ):
+        raise ValueError("BF16 delta FSDP mode does not yet support replicated HSDP mesh dimensions")
+    shard_mesh_dim = shard_mesh_dims[0]
+    placement = parameter.placements[shard_mesh_dim]
+    assert isinstance(placement, Shard)
+    if placement.dim != 0:
+        raise ValueError(f"BF16 delta FSDP mode supports Shard(0), got {placement}")
+    shard_count = parameter.device_mesh.size(shard_mesh_dim)
+    if shard_count == 1:
+        return tuple(parameter.shape), None, 0, 1
+    return (
+        tuple(parameter.shape),
+        0,
+        parameter.device_mesh.get_local_rank(shard_mesh_dim),
+        shard_count,
+    )
 
 
 __all__ = ["DeltaAdamW"]

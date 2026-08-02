@@ -79,6 +79,13 @@ class WeightSyncMetrics:
     delta_gpu_pack_ms: float = 0.0
     nvcomp_batch_count: int = 0
     nvcomp_peak_pending_batches: int = 0
+    trainer_shard_count: int = 0
+    trainer_gather_wall_ms: float = 0.0
+    trainer_gather_gpu_ms: float = 0.0
+    trainer_gather_bytes: int = 0
+    min_rank_compressed_bytes: int = 0
+    max_rank_compressed_bytes: int = 0
+    rank_compressed_bytes: list[int] = field(default_factory=list)
     sender_stage_h2d_ms: float = 0.0
     sender_nccl_ms: float = 0.0
     full_pack_ms: float = 0.0

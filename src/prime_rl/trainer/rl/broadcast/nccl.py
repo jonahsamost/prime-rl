@@ -1,5 +1,7 @@
+import os
 import pickle
 import time
+from math import prod
 from pathlib import Path
 from typing import Callable, Generator, cast
 
@@ -25,9 +27,14 @@ from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 from prime_rl.utils.vlm import get_layer_prefix
 from prime_rl.weight_sync.bf16_delta import (
     BF16DeltaUpdate,
+    CompressedDeltaFrame,
+    DeltaTensorMetadata,
+    ShardedBF16DeltaUpdate,
     WeightUpdateHeader,
     WeightUpdateKind,
     encode_weight_update_header,
+    packed_delta_nbytes,
+    validate_sharded_delta_update,
 )
 from prime_rl.weight_sync.profiling import (
     PhaseProfile,
@@ -101,30 +108,234 @@ def broadcast_bytes(
 
 
 def broadcast_compressed_delta(
-    update: BF16DeltaUpdate,
+    update: ShardedBF16DeltaUpdate,
     communicator: PyNcclCommunicator,
     profile: WeightSyncMetrics | None = None,
 ) -> None:
     metadata = pickle.dumps(
-        (
-            update.tensors,
-            tuple(
-                (
-                    frame.first_tensor_index,
-                    frame.tensor_count,
-                    frame.uncompressed_nbytes,
-                    frame.compressed_nbytes,
-                )
-                for frame in update.frames
-            ),
-        )
+        tuple((shard.tensors, shard.frames, shard.compressed_nbytes) for shard in update.shards)
     )
     broadcast_bytes(metadata, communicator, profile)
-    if update.payload.device != communicator.device:
+    for rank, shard in enumerate(update.shards):
+        if shard.payload.device != communicator.device:
+            raise ValueError(
+                f"BF16 delta payload for trainer rank {rank} is on {shard.payload.device}; "
+                f"NCCL communicator uses {communicator.device}"
+            )
+        _broadcast_tensor(shard.payload, communicator, profile)
+
+
+def _serialize_local_delta_metadata(update: BF16DeltaUpdate) -> bytes:
+    return pickle.dumps((update.base_step, update.step, update.tensors, update.frames))
+
+
+def _deserialize_local_delta_metadata(payload: Tensor, compressed_payload: Tensor) -> BF16DeltaUpdate:
+    decoded = pickle.loads(payload.cpu().numpy().tobytes())
+    if not isinstance(decoded, tuple) or len(decoded) != 4:
+        raise ValueError("invalid trainer BF16 delta metadata envelope")
+    base_step, step, tensors, frames = decoded
+    if not isinstance(base_step, int) or not isinstance(step, int):
+        raise ValueError("trainer BF16 delta metadata has invalid policy versions")
+    if not isinstance(tensors, tuple) or not all(isinstance(item, DeltaTensorMetadata) for item in tensors):
+        raise ValueError("trainer BF16 delta metadata has invalid tensor manifest")
+    if not isinstance(frames, tuple) or not all(isinstance(item, CompressedDeltaFrame) for item in frames):
+        raise ValueError("trainer BF16 delta metadata has invalid frame manifest")
+    if compressed_payload.numel() != packed_delta_nbytes(frames):
         raise ValueError(
-            f"BF16 delta payload is on {update.payload.device}; NCCL communicator uses {communicator.device}"
+            f"trainer BF16 delta payload has {compressed_payload.numel()} bytes; "
+            f"metadata requires {packed_delta_nbytes(frames)}"
         )
-    _broadcast_tensor(update.payload, communicator, profile)
+    return BF16DeltaUpdate(
+        base_step=base_step,
+        step=step,
+        tensors=tensors,
+        frames=frames,
+        payload=compressed_payload,
+    )
+
+
+def _gather_variable_cuda_tensor_to_rank_zero(
+    local_value: Tensor,
+    sizes: list[int],
+) -> Tensor | None:
+    """Collect exact-sized CUDA byte segments on rank 0 through one NCCL collective."""
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    if len(sizes) != world_size or local_value.numel() != sizes[rank]:
+        raise ValueError(
+            f"invalid variable gather sizes {sizes} for rank {rank} tensor with {local_value.numel()} elements"
+        )
+    input_splits = [0] * world_size
+    input_splits[0] = local_value.numel()
+    output_splits = sizes if rank == 0 else [0] * world_size
+    output = torch.empty(
+        sum(output_splits),
+        dtype=local_value.dtype,
+        device=local_value.device,
+    )
+    dist.all_to_all_single(
+        output,
+        local_value,
+        output_split_sizes=output_splits,
+        input_split_sizes=input_splits,
+    )
+    return output if rank == 0 else None
+
+
+def _split_gathered_tensor(value: Tensor, sizes: list[int]) -> list[Tensor]:
+    pieces: list[Tensor] = []
+    offset = 0
+    for size in sizes:
+        pieces.append(value.narrow(0, offset, size))
+        offset += size
+    if offset != value.numel():
+        raise ValueError(f"variable gather describes {offset} elements; received {value.numel()}")
+    return pieces
+
+
+def _delta_gather_debug(rank: int, stage: str, **details: object) -> None:
+    if os.environ.get("PRIME_RL_DELTA_GATHER_DEBUG") != "1":
+        return
+    local_rank = os.environ.get("LOCAL_RANK", "unknown")
+    device = f"cuda:{local_rank}" if local_rank != "unknown" else "cuda:unknown"
+    suffix = " ".join(f"{key}={value}" for key, value in details.items())
+    print(
+        f"[{time.time():.6f}] [bf16-delta-gather pid={os.getpid()} rank={rank} "
+        f"local_rank={local_rank} device={device}] {stage} {suffix}".rstrip(),
+        flush=True,
+    )
+
+
+def gather_compressed_delta_updates(
+    local_update: BF16DeltaUpdate | None,
+    *,
+    profile: WeightSyncMetrics | None = None,
+) -> tuple[ShardedBF16DeltaUpdate | None, bool]:
+    """Gather rank-local compressed FSDP deltas onto trainer rank 0."""
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    if world_size == 1:
+        if local_update is None:
+            return None, False
+        sharded = ShardedBF16DeltaUpdate(
+            base_step=local_update.base_step,
+            step=local_update.step,
+            shards=(local_update,),
+            profile=profile,
+        )
+        validate_sharded_delta_update(sharded)
+        if profile is not None:
+            profile.trainer_shard_count = 1
+            profile.min_rank_compressed_bytes = local_update.compressed_nbytes
+            profile.max_rank_compressed_bytes = local_update.compressed_nbytes
+            profile.rank_compressed_bytes = [local_update.compressed_nbytes]
+        return sharded, True
+
+    device = (
+        local_update.payload.device
+        if local_update is not None
+        else torch.device("cuda", torch.cuda.current_device())
+    )
+    available = torch.tensor([local_update is not None], dtype=torch.uint8, device=device)
+    _delta_gather_debug(rank, "before availability all_reduce", local_available=local_update is not None)
+    dist.all_reduce(available, op=dist.ReduceOp.MIN)
+    _delta_gather_debug(rank, "after availability all_reduce", globally_available=bool(available.item()))
+    if not bool(available.item()):
+        return None, False
+    assert local_update is not None
+
+    metadata_bytes = _serialize_local_delta_metadata(local_update)
+    metadata = torch.frombuffer(bytearray(metadata_bytes), dtype=torch.uint8).to(device)
+    local_sizes = torch.tensor(
+        [metadata.numel(), local_update.payload.numel()],
+        dtype=torch.long,
+        device=device,
+    )
+    gathered_sizes = [torch.empty_like(local_sizes) for _ in range(world_size)]
+    gather_start = time.perf_counter()
+    gather_events = cuda_event_pair() if profile is not None else None
+    if gather_events is not None:
+        gather_events[0].record()
+    _delta_gather_debug(
+        rank,
+        "before size all_gather",
+        metadata_bytes=metadata.numel(),
+        payload_bytes=local_update.payload.numel(),
+    )
+    dist.all_gather(gathered_sizes, local_sizes)
+    sizes = [tuple(int(value) for value in item.tolist()) for item in gathered_sizes]
+    _delta_gather_debug(rank, "after size all_gather", gathered_sizes=sizes)
+
+    metadata_sizes = [metadata_size for metadata_size, _payload_size in sizes]
+    payload_sizes = [payload_size for _metadata_size, payload_size in sizes]
+    _delta_gather_debug(
+        rank,
+        "before metadata all_to_all_single",
+        local_bytes=metadata.numel(),
+        input_splits=[metadata.numel(), *([0] * (world_size - 1))],
+        output_splits=metadata_sizes if rank == 0 else [0] * world_size,
+    )
+    gathered_metadata = _gather_variable_cuda_tensor_to_rank_zero(metadata, metadata_sizes)
+    _delta_gather_debug(
+        rank,
+        "after metadata all_to_all_single",
+        received_bytes=gathered_metadata.numel() if gathered_metadata is not None else 0,
+    )
+    _delta_gather_debug(
+        rank,
+        "before payload all_to_all_single",
+        local_bytes=local_update.payload.numel(),
+        input_splits=[local_update.payload.numel(), *([0] * (world_size - 1))],
+        output_splits=payload_sizes if rank == 0 else [0] * world_size,
+    )
+    gathered_payload = _gather_variable_cuda_tensor_to_rank_zero(local_update.payload, payload_sizes)
+    _delta_gather_debug(
+        rank,
+        "after payload all_to_all_single",
+        received_bytes=gathered_payload.numel() if gathered_payload is not None else 0,
+    )
+    metadata_by_rank: list[Tensor] | None = None
+    payload_by_rank: list[Tensor] | None = None
+    if rank == 0:
+        assert gathered_metadata is not None and gathered_payload is not None
+        metadata_by_rank = _split_gathered_tensor(gathered_metadata, metadata_sizes)
+        # all_to_all_single packs variable-size rank segments back-to-back.
+        # Segment offsets therefore need not preserve nvCOMP's 256-byte input
+        # alignment. Clone each compressed segment into its own CUDA allocation;
+        # this remains a compressed-only operation and gives every rank payload
+        # an aligned base address for decoding and downstream NCCL broadcast.
+        payload_by_rank = [piece.clone() for piece in _split_gathered_tensor(gathered_payload, payload_sizes)]
+    _delta_gather_debug(rank, "before final gather barrier")
+    dist.barrier()
+    _delta_gather_debug(rank, "after final gather barrier")
+    if gather_events is not None:
+        gather_events[1].record()
+        profile.trainer_gather_gpu_ms += elapsed_cuda_ms(gather_events)
+    if profile is not None:
+        profile.trainer_gather_wall_ms += (time.perf_counter() - gather_start) * 1000
+        profile.trainer_shard_count = world_size
+        profile.trainer_gather_bytes += sum(
+            metadata_size + payload_size for metadata_size, payload_size in sizes[1:]
+        )
+        profile.min_rank_compressed_bytes = min(payload_sizes)
+        profile.max_rank_compressed_bytes = max(payload_sizes)
+        profile.rank_compressed_bytes = payload_sizes
+
+    if rank != 0:
+        return None, True
+    assert metadata_by_rank is not None and payload_by_rank is not None
+    shards = [
+        _deserialize_local_delta_metadata(metadata_by_rank[index], payload_by_rank[index])
+        for index in range(world_size)
+    ]
+    sharded = ShardedBF16DeltaUpdate(
+        base_step=local_update.base_step,
+        step=local_update.step,
+        shards=tuple(shards),
+        profile=profile,
+    )
+    validate_sharded_delta_update(sharded)
+    return sharded, True
 
 
 def broadcast_state_dict(
@@ -299,8 +510,12 @@ class NCCLWeightBroadcastSender:
         delta_update: BF16DeltaUpdate | None,
         profile: WeightSyncMetrics | None,
     ) -> None:
-        is_delta_update = delta_update is not None
-        if delta_update is not None:
+        sharded_delta: ShardedBF16DeltaUpdate | None = None
+        is_delta_update = False
+        if self.delta_mode == "bf16_xor":
+            sharded_delta, is_delta_update = gather_compressed_delta_updates(delta_update, profile=profile)
+        if is_delta_update:
+            assert delta_update is not None
             if self.delta_mode != "bf16_xor":
                 raise ValueError("received a BF16 delta update while delta mode is disabled")
             if delta_update.step != step:
@@ -320,9 +535,17 @@ class NCCLWeightBroadcastSender:
             broadcast_update_header(header, self.communicator, profile)
 
         if is_delta_update:
-            assert delta_update is not None
             if self.world.is_master:
-                broadcast_compressed_delta(delta_update, self.communicator, profile)
+                assert sharded_delta is not None
+                if profile is not None:
+                    profile.raw_bytes = sharded_delta.uncompressed_nbytes
+                    profile.compressed_bytes = sharded_delta.compressed_nbytes
+                    profile.tensor_count = sharded_delta.tensor_count
+                    profile.frame_count = sharded_delta.frame_count
+                    profile.largest_tensor_bytes = max(
+                        prod(item.resolved_global_shape) * 2 for item in sharded_delta.shards[0].tensors
+                    )
+                broadcast_compressed_delta(sharded_delta, self.communicator, profile)
             self.last_broadcast_step = step
             return
 

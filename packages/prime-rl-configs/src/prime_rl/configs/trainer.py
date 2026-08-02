@@ -551,7 +551,11 @@ class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
 
     delta_mode: Literal["none", "bf16_xor"] = "none"
-    """Experimental GPU nvCOMP LZ4 BF16 XOR updates. Startup remains a full checkpoint transfer."""
+    """Experimental dense-Qwen3 GPU nvCOMP LZ4 BF16 XOR updates.
+
+    Startup remains a full checkpoint transfer. FSDP ranks compress local
+    ``Shard(0)`` deltas before trainer rank 0 gathers them for NCCL broadcast.
+    """
 
     delta_adam_bucket_mb: int = Field(256, ge=1)
     """Maximum local parameter MiB updated by each batched AdamW call.

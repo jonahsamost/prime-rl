@@ -376,8 +376,13 @@ class RLConfig(BaseConfig):
             raise ValueError("weight_broadcast.delta_mode='bf16_xor' is incompatible with quantized transfer.")
         if self.inference is None:
             raise ValueError("weight_broadcast.delta_mode='bf16_xor' requires an inference config.")
-        if self.model is None or self.model.name != "Qwen/Qwen3-0.6B-Base":
-            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently supports only Qwen/Qwen3-0.6B-Base.")
+        if (
+            self.model is None
+            or "Qwen3" not in self.model.name
+            or "A3B" in self.model.name
+            or "A22B" in self.model.name
+        ):
+            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently supports dense Qwen3 models only.")
         if self.trainer.optim.type != "adamw":
             raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently requires trainer.optim.type='adamw'.")
         if self.trainer.max_concurrent_runs != 1:
@@ -388,13 +393,14 @@ class RLConfig(BaseConfig):
             )
         if self.trainer.model.quantization is not None or self.inference.quantization is not None:
             raise ValueError("weight_broadcast.delta_mode='bf16_xor' does not support quantized models.")
-        if self.inference.parallel.tp != 1:
-            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently requires inference.parallel.tp=1.")
-        if self.deployment.type != "single_node" or self.deployment.num_train_gpus != 1:
+        if self.trainer.model.dp_replicate != 1 or self.trainer.model.cp != 1:
             raise ValueError(
-                "weight_broadcast.delta_mode='bf16_xor' currently requires a single-node deployment with "
-                "deployment.num_train_gpus=1."
+                "weight_broadcast.delta_mode='bf16_xor' currently requires trainer.model.dp_replicate=1 and cp=1."
             )
+        if self.trainer.model.ep not in ("auto", 1):
+            raise ValueError("weight_broadcast.delta_mode='bf16_xor' does not yet support expert parallelism.")
+        if self.deployment.type != "single_node":
+            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently requires a single-node deployment.")
         return self
 
     ### Auto-setup shared configs (before sub-config construction)

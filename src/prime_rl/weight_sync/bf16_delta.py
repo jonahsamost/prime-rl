@@ -14,7 +14,7 @@ from torch.distributed.tensor import DTensor
 from prime_rl.weight_sync.profiling import WeightSyncMetrics, cuda_event_pair
 
 NCCL_DELTA_PROTOCOL_MAGIC = 0x50524C44  # "PRLD"
-NCCL_DELTA_PROTOCOL_VERSION = 5
+NCCL_DELTA_PROTOCOL_VERSION = 6
 NVCOMP_FRAME_ALIGNMENT = 256
 NVCOMP_PIPELINE_DEPTH = 2
 
@@ -73,6 +73,18 @@ class DeltaTensorMetadata:
     name: str
     shape: tuple[int, ...]
     nbytes: int
+    global_shape: tuple[int, ...] | None = None
+    shard_dim: int | None = None
+    shard_index: int = 0
+    shard_count: int = 1
+
+    @property
+    def resolved_global_shape(self) -> tuple[int, ...]:
+        return self.shape if self.global_shape is None else self.global_shape
+
+    @property
+    def local_shape(self) -> tuple[int, ...]:
+        return self.shape
 
 
 @dataclass(frozen=True)
@@ -133,6 +145,32 @@ class BF16DeltaUpdate:
             raise ValueError(
                 f"compressed frame metadata describes {offset} bytes but payload has {self.compressed_nbytes}"
             )
+
+
+@dataclass(frozen=True)
+class ShardedBF16DeltaUpdate:
+    """Rank-local compressed FSDP shards for one logical policy update."""
+
+    base_step: int
+    step: int
+    shards: tuple[BF16DeltaUpdate, ...]
+    profile: WeightSyncMetrics | None = field(default=None, compare=False, repr=False)
+
+    @property
+    def uncompressed_nbytes(self) -> int:
+        return sum(shard.uncompressed_nbytes for shard in self.shards)
+
+    @property
+    def compressed_nbytes(self) -> int:
+        return sum(shard.compressed_nbytes for shard in self.shards)
+
+    @property
+    def tensor_count(self) -> int:
+        return len(self.shards[0].tensors) if self.shards else 0
+
+    @property
+    def frame_count(self) -> int:
+        return len(self.shards[0].frames) if self.shards else 0
 
 
 def local_tensor(tensor: Tensor) -> Tensor:
@@ -405,6 +443,19 @@ class BF16DeltaEncoder:
         self.append_bucket(bucket_values, bucket)
 
     def append_bucket(self, values: Sequence[tuple[str, Tensor]], bucket: Tensor) -> None:
+        self.append_sharded_bucket(values, bucket)
+
+    def append_sharded_bucket(
+        self,
+        values: Sequence[tuple[str, Tensor]],
+        bucket: Tensor,
+        *,
+        global_shapes: Sequence[tuple[int, ...]] | None = None,
+        shard_descriptors: Sequence[tuple[int | None, int, int]] | None = None,
+        shard_dim: int | None = None,
+        shard_index: int = 0,
+        shard_count: int = 1,
+    ) -> None:
         if self._finished:
             raise RuntimeError("cannot append to a finished BF16 delta encoder")
         normalized = self._normalize_values(values)
@@ -428,13 +479,34 @@ class BF16DeltaEncoder:
                 raise ValueError(f"{name} is not the expected contiguous view into its BF16 delta bucket")
             offset += value.numel()
 
+        if global_shapes is None:
+            global_shapes = [tuple(value.shape) for _, value in normalized]
+        if len(global_shapes) != len(normalized):
+            raise ValueError(
+                f"received {len(global_shapes)} global shapes for {len(normalized)} BF16 delta tensors"
+            )
+        if shard_descriptors is None:
+            shard_descriptors = [(shard_dim, shard_index, shard_count)] * len(normalized)
+        if len(shard_descriptors) != len(normalized):
+            raise ValueError(
+                f"received {len(shard_descriptors)} shard descriptors for {len(normalized)} BF16 delta tensors"
+            )
         metadata = tuple(
             DeltaTensorMetadata(
                 name=name,
                 shape=tuple(value.shape),
                 nbytes=value.numel() * value.element_size(),
+                global_shape=tuple(global_shape),
+                shard_dim=descriptor[0],
+                shard_index=descriptor[1],
+                shard_count=descriptor[2],
             )
-            for name, value in normalized
+            for (name, value), global_shape, descriptor in zip(
+                normalized,
+                global_shapes,
+                shard_descriptors,
+                strict=True,
+            )
         )
         first_tensor_index = len(self._tensors)
         self._tensors.extend(metadata)
@@ -582,6 +654,11 @@ def validate_delta_update(update: BF16DeltaUpdate) -> None:
             "BF16 delta payload must be a contiguous CUDA uint8 tensor; "
             f"got dtype={update.payload.dtype}, device={update.payload.device}, stride={update.payload.stride()}"
         )
+    if update.payload.data_ptr() % NVCOMP_FRAME_ALIGNMENT != 0:
+        raise ValueError(
+            f"BF16 delta payload address {update.payload.data_ptr():#x} is not "
+            f"{NVCOMP_FRAME_ALIGNMENT}-byte aligned"
+        )
     names: set[str] = set()
     for tensor in update.tensors:
         if not tensor.name or tensor.name in names:
@@ -590,6 +667,20 @@ def validate_delta_update(update: BF16DeltaUpdate) -> None:
         expected = prod(tensor.shape) * 2
         if tensor.nbytes != expected:
             raise ValueError(f"{tensor.name} metadata has {tensor.nbytes} bytes; shape requires {expected}")
+        global_shape = tensor.resolved_global_shape
+        if len(global_shape) != len(tensor.shape):
+            raise ValueError(
+                f"{tensor.name} local rank {len(tensor.shape)} does not match global rank {len(global_shape)}"
+            )
+        if tensor.shard_count <= 0 or not 0 <= tensor.shard_index < tensor.shard_count:
+            raise ValueError(
+                f"{tensor.name} has invalid shard {tensor.shard_index}/{tensor.shard_count}"
+            )
+        if tensor.shard_count == 1:
+            if tensor.shard_dim is not None or tensor.shape != global_shape:
+                raise ValueError(f"unsharded tensor {tensor.name} must have identical local and global shapes")
+        elif tensor.shard_dim != 0:
+            raise ValueError(f"{tensor.name} uses unsupported shard dimension {tensor.shard_dim}; expected 0")
     next_tensor_index = 0
     for frame_index, frame in enumerate(update.frames):
         if frame.first_tensor_index != next_tensor_index:
@@ -617,6 +708,117 @@ def validate_delta_update(update: BF16DeltaUpdate) -> None:
             f"aligned compressed frame metadata describes {packed_bytes} bytes "
             f"but payload has {update.compressed_nbytes}"
         )
+
+
+def validate_sharded_delta_update(update: ShardedBF16DeltaUpdate) -> None:
+    if not update.shards:
+        raise ValueError("distributed BF16 delta update has no trainer shards")
+    shard_count = len(update.shards)
+    reference = update.shards[0]
+    for rank, shard in enumerate(update.shards):
+        validate_delta_update(shard)
+        if shard.base_step != update.base_step or shard.step != update.step:
+            raise ValueError(
+                f"trainer shard {rank} names policy {shard.base_step}->{shard.step}; "
+                f"expected {update.base_step}->{update.step}"
+            )
+        if len(shard.tensors) != len(reference.tensors) or len(shard.frames) != len(reference.frames):
+            raise ValueError(f"trainer shard {rank} has an incompatible tensor/frame manifest")
+        for tensor_index, (candidate, expected) in enumerate(zip(shard.tensors, reference.tensors, strict=True)):
+            if candidate.name != expected.name or candidate.resolved_global_shape != expected.resolved_global_shape:
+                raise ValueError(f"trainer shard {rank} tensor {tensor_index} does not match the rank-0 manifest")
+            if expected.shard_count == 1:
+                if (
+                    candidate.shard_count != 1
+                    or candidate.shard_index != 0
+                    or candidate.shard_dim is not None
+                    or candidate.shape != candidate.resolved_global_shape
+                ):
+                    raise ValueError(f"trainer shard {rank} has incompatible unsharded metadata for {candidate.name}")
+            elif candidate.shard_index != rank or candidate.shard_count != shard_count:
+                raise ValueError(
+                    f"{candidate.name} identifies shard {candidate.shard_index}/{candidate.shard_count}; "
+                    f"expected {rank}/{shard_count}"
+                )
+        for frame_index, (candidate, expected) in enumerate(zip(shard.frames, reference.frames, strict=True)):
+            if (candidate.first_tensor_index, candidate.tensor_count) != (
+                expected.first_tensor_index,
+                expected.tensor_count,
+            ):
+                raise ValueError(f"trainer shard {rank} frame {frame_index} has an incompatible tensor manifest")
+
+    for tensor_index in range(len(reference.tensors)):
+        pieces = [shard.tensors[tensor_index] for shard in update.shards]
+        global_shape = pieces[0].resolved_global_shape
+        if pieces[0].shard_count == 1:
+            if any(piece.shard_count != 1 or piece.shape != global_shape for piece in pieces):
+                raise ValueError(f"{pieces[0].name} has inconsistent unsharded trainer copies")
+            continue
+        if any(piece.shard_dim != 0 for piece in pieces):
+            raise ValueError(f"{pieces[0].name} is not sharded along source dimension 0")
+        if any(piece.shape[1:] != global_shape[1:] for piece in pieces):
+            raise ValueError(f"{pieces[0].name} shard trailing dimensions do not match its global shape")
+        reconstructed = (sum(piece.shape[0] for piece in pieces), *global_shape[1:])
+        if reconstructed != global_shape:
+            raise ValueError(
+                f"{pieces[0].name} shards reconstruct shape {reconstructed}; expected {global_shape}"
+            )
+
+
+def reconstruct_delta_tensors(
+    shard_values: Sequence[Sequence[tuple[str, Tensor]]],
+    shard_metadata: Sequence[Sequence[DeltaTensorMetadata]],
+) -> list[tuple[str, Tensor]]:
+    """Reconstruct full source-layout tensors from rank-ordered dimension-0 shards."""
+    if not shard_values or len(shard_values) != len(shard_metadata):
+        raise ValueError("BF16 delta reconstruction requires matching non-empty values and metadata")
+    tensor_count = len(shard_values[0])
+    if any(len(values) != tensor_count for values in shard_values) or any(
+        len(metadata) != tensor_count for metadata in shard_metadata
+    ):
+        raise ValueError("BF16 delta shard frames contain different tensor counts")
+    reconstructed: list[tuple[str, Tensor]] = []
+    for tensor_index in range(tensor_count):
+        pieces = [values[tensor_index][1] for values in shard_values]
+        metadata = [items[tensor_index] for items in shard_metadata]
+        names = [values[tensor_index][0] for values in shard_values]
+        if any(name != names[0] for name in names) or any(item.name != names[0] for item in metadata):
+            raise ValueError(f"BF16 delta shard tensor {tensor_index} has inconsistent names")
+        global_shape = metadata[0].resolved_global_shape
+        if any(item.resolved_global_shape != global_shape for item in metadata):
+            raise ValueError(f"{names[0]} has inconsistent global shapes")
+        if metadata[0].shard_count == 1:
+            if any(
+                item.shard_count != 1
+                or item.shard_index != 0
+                or item.shard_dim is not None
+                or item.shape != global_shape
+                for item in metadata
+            ):
+                raise ValueError(f"{names[0]} has inconsistent unsharded metadata")
+        else:
+            expected_indices = list(range(metadata[0].shard_count))
+            actual_indices = sorted(item.shard_index for item in metadata)
+            if (
+                len(metadata) != metadata[0].shard_count
+                or actual_indices != expected_indices
+                or any(item.shard_count != len(metadata) or item.shard_dim != 0 for item in metadata)
+            ):
+                raise ValueError(
+                    f"{names[0]} has malformed dimension-0 shards: "
+                    f"indices={actual_indices}, expected={expected_indices}"
+                )
+        ordered = sorted(zip(metadata, pieces, strict=True), key=lambda item: item[0].shard_index)
+        if ordered[0][0].shard_count == 1:
+            value = ordered[0][1]
+        else:
+            value = torch.cat([piece for _, piece in ordered], dim=0)
+        if tuple(value.shape) != global_shape:
+            raise ValueError(f"{names[0]} reconstructed shape {tuple(value.shape)}; expected {global_shape}")
+        reconstructed.append((names[0], value))
+    return reconstructed
+
+
 def _sum_completed_events(events: Iterable[tuple[torch.cuda.Event, torch.cuda.Event]]) -> float:
     return sum(start.elapsed_time(end) for start, end in events)
 
@@ -643,6 +845,7 @@ def _packed_nbytes(payloads: Sequence[Tensor]) -> int:
 __all__ = [
     "BF16DeltaEncoder",
     "BF16DeltaUpdate",
+    "ShardedBF16DeltaUpdate",
     "CompressedDeltaFrame",
     "DeltaTensorMetadata",
     "NvcompLZ4Codec",
@@ -653,5 +856,7 @@ __all__ = [
     "encode_weight_update_header",
     "local_tensor",
     "packed_delta_nbytes",
+    "reconstruct_delta_tensors",
     "validate_delta_update",
+    "validate_sharded_delta_update",
 ]

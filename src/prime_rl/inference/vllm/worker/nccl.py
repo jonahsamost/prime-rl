@@ -1,6 +1,7 @@
 import pickle
 import re
 import time
+from math import prod
 from typing import TYPE_CHECKING, Generator, cast
 
 import torch
@@ -21,12 +22,14 @@ from prime_rl.weight_sync.bf16_delta import (
     CompressedDeltaFrame,
     DeltaTensorMetadata,
     NvcompLZ4Codec,
+    ShardedBF16DeltaUpdate,
     WeightUpdateHeader,
     WeightUpdateKind,
     decode_delta_tensors,
     decode_weight_update_header,
     packed_delta_nbytes,
-    validate_delta_update,
+    reconstruct_delta_tensors,
+    validate_sharded_delta_update,
 )
 from prime_rl.weight_sync.profiling import (
     PhaseProfiler,
@@ -108,35 +111,43 @@ def receive_compressed_delta(
     base_step: int,
     step: int,
     profile: WeightSyncMetrics | None = None,
-) -> BF16DeltaUpdate:
-    tensors, frame_sizes = pickle.loads(receive_bytes(communicator, profile))
-    if not isinstance(tensors, tuple) or not all(isinstance(item, DeltaTensorMetadata) for item in tensors):
-        raise RuntimeError("invalid BF16 delta tensor metadata")
-    frames = tuple(
-        CompressedDeltaFrame(
-            first_tensor_index=first_tensor_index,
-            tensor_count=tensor_count,
-            uncompressed_nbytes=uncompressed_nbytes,
-            compressed_nbytes=compressed_nbytes,
+) -> ShardedBF16DeltaUpdate:
+    shard_metadata = pickle.loads(receive_bytes(communicator, profile))
+    if not isinstance(shard_metadata, tuple) or not shard_metadata:
+        raise RuntimeError("invalid distributed BF16 delta metadata")
+    shards: list[BF16DeltaUpdate] = []
+    for rank, item in enumerate(shard_metadata):
+        if not isinstance(item, tuple) or len(item) != 3:
+            raise RuntimeError(f"invalid BF16 delta metadata for trainer shard {rank}")
+        tensors, frames, compressed_nbytes = item
+        if not isinstance(tensors, tuple) or not all(isinstance(tensor, DeltaTensorMetadata) for tensor in tensors):
+            raise RuntimeError(f"invalid BF16 delta tensor metadata for trainer shard {rank}")
+        if not isinstance(frames, tuple) or not all(isinstance(frame, CompressedDeltaFrame) for frame in frames):
+            raise RuntimeError(f"invalid BF16 delta frame metadata for trainer shard {rank}")
+        if compressed_nbytes != packed_delta_nbytes(frames):
+            raise RuntimeError(
+                f"trainer shard {rank} metadata describes {packed_delta_nbytes(frames)} compressed bytes; "
+                f"sender announced {compressed_nbytes}"
+            )
+        payload = torch.empty(compressed_nbytes, dtype=torch.uint8, device=communicator.device)
+        _receive_tensor(payload, communicator, profile)
+        shards.append(
+            BF16DeltaUpdate(
+                base_step=base_step,
+                step=step,
+                tensors=tensors,
+                frames=frames,
+                payload=payload,
+            )
         )
-        for first_tensor_index, tensor_count, uncompressed_nbytes, compressed_nbytes in frame_sizes
-    )
-    payload = torch.empty(
-        packed_delta_nbytes(frames),
-        dtype=torch.uint8,
-        device=communicator.device,
-    )
-    _receive_tensor(payload, communicator, profile)
-    update = BF16DeltaUpdate(
+    update = ShardedBF16DeltaUpdate(
         base_step=base_step,
         step=step,
-        tensors=tensors,
-        frames=frames,
-        payload=payload,
+        shards=tuple(shards),
         profile=profile,
     )
     try:
-        validate_delta_update(update)
+        validate_sharded_delta_update(update)
     except ValueError as error:
         raise RuntimeError(str(error)) from error
     return update
@@ -322,14 +333,21 @@ class NCCLWeightUpdateWorker(Worker):
                 if profile is not None:
                     profile.raw_bytes = update.uncompressed_nbytes
                     profile.compressed_bytes = update.compressed_nbytes
-                    profile.tensor_count = len(update.tensors)
-                    profile.frame_count = len(update.frames)
-                    profile.largest_tensor_bytes = max(item.nbytes for item in update.tensors)
+                    profile.tensor_count = update.tensor_count
+                    profile.frame_count = update.frame_count
+                    profile.trainer_shard_count = len(update.shards)
+                    profile.rank_compressed_bytes = [shard.compressed_nbytes for shard in update.shards]
+                    profile.min_rank_compressed_bytes = min(profile.rank_compressed_bytes)
+                    profile.max_rank_compressed_bytes = max(profile.rank_compressed_bytes)
+                    profile.largest_tensor_bytes = max(
+                        prod(item.resolved_global_shape) * 2 for item in update.shards[0].tensors
+                    )
                 logger.info(
-                    "Received nvCOMP LZ4 BF16 XOR update: %d tensors in %d frames, "
+                    "Received nvCOMP LZ4 BF16 XOR update: %d tensors in %d frames from %d trainer shards, "
                     "%.2f MiB compressed from %.2f MiB (%.1fx)",
-                    len(update.tensors),
-                    len(update.frames),
+                    update.tensor_count,
+                    update.frame_count,
+                    len(update.shards),
                     update.compressed_nbytes / (1024 * 1024),
                     update.uncompressed_nbytes / (1024 * 1024),
                     update.uncompressed_nbytes / update.compressed_nbytes,
@@ -337,31 +355,51 @@ class NCCLWeightUpdateWorker(Worker):
                 apply_start = time.perf_counter()
                 codec = self.nccl_broadcast_receiver.delta_codec
                 assert codec is not None
-                frame_payloads = list(update.frame_payloads())
+                frame_payloads = [list(shard.frame_payloads()) for shard in update.shards]
                 decode_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
-                for frame, frame_payload in zip(update.frames, frame_payloads, strict=True):
-                    decoded, events = decode_delta_tensors(
-                        codec,
-                        update.tensors,
-                        [frame],
-                        [frame_payload],
-                        profile=profile is not None,
-                    )
-                    if events is not None:
-                        decode_events.append(events)
+                for frame_index in range(update.frame_count):
+                    decoded_shards: list[list[tuple[str, torch.Tensor]]] = []
+                    metadata_shards: list[tuple[DeltaTensorMetadata, ...]] = []
+                    for shard_index, shard in enumerate(update.shards):
+                        frame = shard.frames[frame_index]
+                        decoded, events = decode_delta_tensors(
+                            codec,
+                            shard.tensors,
+                            [frame],
+                            [frame_payloads[shard_index][frame_index]],
+                            profile=profile is not None,
+                        )
+                        if events is not None:
+                            decode_events.append(events)
+                        decoded_shards.append(decoded)
+                        metadata_shards.append(
+                            shard.tensors[
+                                frame.first_tensor_index : frame.first_tensor_index + frame.tensor_count
+                            ]
+                        )
+                    reference_metadata = metadata_shards[0]
                     group_start = 0
-                    while group_start < len(decoded):
-                        layer_index = qwen_layer_index(decoded[group_start][0])
+                    while group_start < len(reference_metadata):
+                        layer_index = qwen_layer_index(reference_metadata[group_start].name)
                         group_end = group_start + 1
-                        while group_end < len(decoded) and qwen_layer_index(decoded[group_end][0]) == layer_index:
+                        while (
+                            group_end < len(reference_metadata)
+                            and qwen_layer_index(reference_metadata[group_end].name) == layer_index
+                        ):
                             group_end += 1
+                        decoded_group = reconstruct_delta_tensors(
+                            [values[group_start:group_end] for values in decoded_shards],
+                            [metadata[group_start:group_end] for metadata in metadata_shards],
+                        )
                         apply_qwen3_bf16_source_deltas_(
                             model,
-                            dict(decoded[group_start:group_end]),
+                            dict(decoded_group),
                             layer_index=layer_index,
                             profile=profile,
                         )
+                        del decoded_group
                         group_start = group_end
+                    del decoded_shards, metadata_shards
                 torch.cuda.synchronize(self.device)
                 if profile is not None:
                     profile.nvcomp_decompress_gpu_ms += sum(start.elapsed_time(end) for start, end in decode_events)

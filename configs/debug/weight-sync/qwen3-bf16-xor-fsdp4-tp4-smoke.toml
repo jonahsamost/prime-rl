@@ -1,0 +1,57 @@
+max_steps = 6
+seq_len = 1024
+
+[model]
+name = "Qwen/Qwen3-0.6B-Base"
+
+[trainer.model]
+optimization_dtype = "bfloat16"
+compile = "None"
+dp_replicate = 1
+cp = 1
+ep = 1
+
+[trainer.optim]
+lr = 3e-6
+
+[orchestrator]
+batch_size = 8
+group_size = 4
+
+[orchestrator.renderer]
+name = "prime-qwen3"
+
+[orchestrator.train.sampling]
+max_completion_tokens = 128
+
+[[orchestrator.train.source]]
+name = "reverse-text"
+
+[orchestrator.train.source.env.taskset]
+id = "reverse-text-v1"
+
+[orchestrator.train.source.env.agent.harness]
+id = "null"
+
+[orchestrator.train.source.env.agent.runtime]
+type = "subprocess"
+
+[inference]
+gpu_memory_utilization = 0.5
+
+[inference.parallel]
+tp = 4
+dp = 1
+
+[weight_broadcast]
+type = "nccl"
+delta_mode = "bf16_xor"
+delta_adam_bucket_mb = 256
+
+[weight_broadcast.profiling]
+sample_interval_ms = 5
+
+[deployment]
+type = "single_node"
+num_train_gpus = 4
+num_infer_gpus = 4
