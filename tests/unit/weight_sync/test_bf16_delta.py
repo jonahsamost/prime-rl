@@ -254,6 +254,9 @@ def test_delta_adamw_matches_adamw_and_emits_exact_parameter_xor():
         reference_parameter.grad = gradient.clone()
         delta_parameter.grad = gradient.clone()
 
+    with pytest.raises(RuntimeError, match=r"DeltaAdamW\.step\(\) requires begin_delta\(\)"):
+        delta_optimizer.step()
+
     reference_optimizer.step()
     delta_optimizer.begin_delta(base_step=2, step=3)
     delta_optimizer.step()

@@ -18,6 +18,12 @@ lr = 3e-6
 batch_size = 8
 group_size = 4
 
+# Keep uniform-reward groups so the weight-sync smoke always reaches an
+# optimizer step instead of terminating after consecutive empty batches.
+[[orchestrator.post_batch_filters]]
+type = "zero_advantage"
+enforce = false
+
 [orchestrator.renderer]
 name = "prime-qwen3"
 

@@ -610,9 +610,7 @@ def train(config: TrainerConfig):
         # The delta-aware AdamW bounds snapshots by update bucket and releases
         # each bucket after nvCOMP has consumed its GPU-resident parameter XORs.
         delta_update: BF16DeltaUpdate | None = None
-        record_delta = delta_optimizer is not None and not (
-            config.max_steps is not None and progress.step >= config.max_steps - 1
-        )
+        record_delta = delta_optimizer is not None
         if record_delta:
             delta_optimizer.begin_delta(base_step=progress.step - 1, step=progress.step)
         with optimizer_profiler.measure("optimizer_step") as optimizer_phase:
@@ -690,6 +688,9 @@ def train(config: TrainerConfig):
                     weight_broadcast.maybe_clean(interval_to_keep)
             else:
                 broadcast_weights_time = 0
+                # DeltaAdamW always records to preserve its bounded update path;
+                # release the shutdown-only payload when no consumer needs it.
+                delta_update = None
                 # Usually the broadcast will set this. If broadcast is skipped, we need to reset this here.
                 for idx in multi_run_manager.used_idxs:
                     multi_run_manager.ready_to_update[idx] = False

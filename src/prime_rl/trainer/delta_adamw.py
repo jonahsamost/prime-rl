@@ -100,7 +100,7 @@ class DeltaAdamW(AdamW):
     @_use_grad_for_differentiable
     def step(self, closure: Callable[[], float] | None = None):
         if self._encoder is None:
-            return super().step(closure)
+            raise RuntimeError("DeltaAdamW.step() requires begin_delta()")
         if hasattr(self, "_accelerator_graph_capture_health_check"):
             self._accelerator_graph_capture_health_check()
         else:
