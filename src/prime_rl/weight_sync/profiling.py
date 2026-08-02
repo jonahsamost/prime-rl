@@ -57,6 +57,7 @@ class PhaseProfile:
 
 @dataclass
 class WeightSyncMetrics:
+    optimizer_to_inference_apply_ms: float = 0.0
     optimizer_step_wall_ms: float = 0.0
     optimizer_step_gpu_ms: float = 0.0
     optimizer_state_h2d_ms: float = 0.0

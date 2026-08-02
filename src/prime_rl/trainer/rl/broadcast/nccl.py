@@ -456,6 +456,7 @@ class NCCLWeightBroadcastSender:
         self.last_broadcast_step: int | None = None
         self.last_profile: WeightSyncMetrics | None = None
         self._optimizer_step_profile: tuple[float, float, PhaseProfile] | None = None
+        self._optimizer_start_ns = 0
         if self.delta_mode != "none" and self.quantize_in_weight_transfer:
             raise ValueError("BF16 XOR delta mode is incompatible with quantize_in_weight_transfer")
 
@@ -489,6 +490,7 @@ class NCCLWeightBroadcastSender:
         phase_name = "delta_send" if delta_update is not None else "full_send"
         with self.profiler.measure(phase_name) as phase:
             self._broadcast_weights(model, step, delta_update, profile)
+        self._optimizer_start_ns = 0
         if profile is not None:
             if self._optimizer_step_profile is not None:
                 wall_ms, gpu_ms, optimizer_phase = self._optimizer_step_profile
@@ -502,6 +504,11 @@ class NCCLWeightBroadcastSender:
 
     def set_optimizer_step_profile(self, *, wall_ms: float, gpu_ms: float, phase: PhaseProfile) -> None:
         self._optimizer_step_profile = (wall_ms, gpu_ms, phase)
+
+    def set_optimizer_start_ns(self, optimizer_start_ns: int) -> None:
+        if optimizer_start_ns <= 0:
+            raise ValueError(f"optimizer_start_ns must be positive, got {optimizer_start_ns}")
+        self._optimizer_start_ns = optimizer_start_ns
 
     def _broadcast_weights(
         self,
@@ -526,12 +533,17 @@ class NCCLWeightBroadcastSender:
                 )
             if getattr(model.config, "model_type", None) != "qwen3":
                 raise ValueError("BF16 XOR delta broadcast currently supports Qwen3 only")
-            header = WeightUpdateHeader(WeightUpdateKind.BF16_XOR, delta_update.base_step, step)
+            header = WeightUpdateHeader(
+                WeightUpdateKind.BF16_XOR,
+                delta_update.base_step,
+                step,
+                self._optimizer_start_ns,
+            )
         else:
-            header = WeightUpdateHeader(WeightUpdateKind.FULL, -1, step)
+            header = WeightUpdateHeader(WeightUpdateKind.FULL, -1, step, self._optimizer_start_ns)
             state_dict = model.state_dict()
 
-        if self.world.is_master and self.delta_mode != "none":
+        if self.world.is_master:
             broadcast_update_header(header, self.communicator, profile)
 
         if is_delta_update:

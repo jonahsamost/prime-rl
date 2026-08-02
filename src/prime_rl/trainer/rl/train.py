@@ -614,6 +614,7 @@ def train(config: TrainerConfig):
         if record_delta:
             delta_optimizer.begin_delta(base_step=progress.step - 1, step=progress.step)
         with optimizer_profiler.measure("optimizer_step") as optimizer_phase:
+            optimizer_start_ns = time.perf_counter_ns()
             optimizer_events = cuda_event_pair() if profile_weight_sync else None
             if optimizer_events is not None:
                 optimizer_events[0].record()
@@ -662,12 +663,14 @@ def train(config: TrainerConfig):
             )
             if not broadcast_unused:
                 broadcast_weights_start_time = time.perf_counter()
-                if isinstance(weight_broadcast, NCCLWeightBroadcast) and profile_weight_sync:
-                    weight_broadcast.nccl_broadcast_sender.set_optimizer_step_profile(
-                        wall_ms=optimizer_step_wall_ms,
-                        gpu_ms=optimizer_step_gpu_ms,
-                        phase=optimizer_phase,
-                    )
+                if isinstance(weight_broadcast, NCCLWeightBroadcast):
+                    weight_broadcast.nccl_broadcast_sender.set_optimizer_start_ns(optimizer_start_ns)
+                    if profile_weight_sync:
+                        weight_broadcast.nccl_broadcast_sender.set_optimizer_step_profile(
+                            wall_ms=optimizer_step_wall_ms,
+                            gpu_ms=optimizer_step_gpu_ms,
+                            phase=optimizer_phase,
+                        )
                 if delta_update is not None:
                     assert isinstance(weight_broadcast, NCCLWeightBroadcast)
                     weight_broadcast.broadcast_weights(model, step=progress.step, delta_update=delta_update)

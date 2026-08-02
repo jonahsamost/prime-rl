@@ -80,7 +80,7 @@ def receive_update_header(
     communicator: PyNcclCommunicator,
     profile: WeightSyncMetrics | None = None,
 ) -> WeightUpdateHeader:
-    values = torch.empty(5, dtype=torch.long, device=communicator.device)
+    values = torch.empty(6, dtype=torch.long, device=communicator.device)
     _receive_tensor(values, communicator, profile)
     try:
         return decode_weight_update_header(values)
@@ -248,8 +248,6 @@ class NCCLWeightBroadcastReceiver:
                 yield key, value
 
     def receive_update_header(self, profile: WeightSyncMetrics | None = None) -> WeightUpdateHeader | None:
-        if self.delta_mode == "none":
-            return None
         return receive_update_header(self.communicator, profile)
 
 
@@ -403,6 +401,11 @@ class NCCLWeightUpdateWorker(Worker):
                 torch.cuda.synchronize(self.device)
                 if profile is not None:
                     profile.nvcomp_decompress_gpu_ms += sum(start.elapsed_time(end) for start, end in decode_events)
+            optimizer_to_apply_ms = (
+                (time.perf_counter_ns() - header.optimizer_start_ns) / 1_000_000
+                if header.optimizer_start_ns
+                else 0.0
+            )
             logger.info(
                 "Applied nvCOMP LZ4 BF16 XOR update for policy v%d in %.2fs",
                 header.step,
@@ -410,7 +413,14 @@ class NCCLWeightUpdateWorker(Worker):
             )
             if profile is not None:
                 profile.phases[phase.name] = phase
+                profile.optimizer_to_inference_apply_ms = optimizer_to_apply_ms
                 logger.info(profile.structured_log(event="weight_sync_profile", step=header.step, role="inference"))
+            if header.optimizer_start_ns:
+                logger.info(
+                    "Policy v%d optimizer-start to inference-apply: %.2f ms",
+                    header.step,
+                    optimizer_to_apply_ms,
+                )
             self.nccl_broadcast_receiver.current_step = header.step
             return
 
@@ -426,15 +436,26 @@ class NCCLWeightUpdateWorker(Worker):
                     self.model_runner.model_config,
                     self.vllm_config,
                 )
-            if profile is not None:
-                torch.cuda.synchronize(self.device)
+            torch.cuda.synchronize(self.device)
+        optimizer_to_apply_ms = (
+            (time.perf_counter_ns() - header.optimizer_start_ns) / 1_000_000
+            if header is not None and header.optimizer_start_ns
+            else 0.0
+        )
         if profile is not None:
             profile.phases[phase.name] = phase
             profile.full_apply_ms = max(
                 0.0,
                 phase.wall_ms - profile.receiver_nccl_ms - profile.receiver_stage_d2h_ms,
             )
+            profile.optimizer_to_inference_apply_ms = optimizer_to_apply_ms
             step = header.step if header is not None else requested_step
             logger.info(profile.structured_log(event="weight_sync_profile", step=step, role="inference"))
+        if header is not None and header.optimizer_start_ns:
+            logger.info(
+                "Policy v%d optimizer-start to inference-apply: %.2f ms",
+                header.step,
+                optimizer_to_apply_ms,
+            )
         if header is not None:
             self.nccl_broadcast_receiver.current_step = header.step

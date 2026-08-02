@@ -14,7 +14,7 @@ from torch.distributed.tensor import DTensor
 from prime_rl.weight_sync.profiling import WeightSyncMetrics, cuda_event_pair
 
 NCCL_DELTA_PROTOCOL_MAGIC = 0x50524C44  # "PRLD"
-NCCL_DELTA_PROTOCOL_VERSION = 6
+NCCL_DELTA_PROTOCOL_VERSION = 7
 NVCOMP_FRAME_ALIGNMENT = 256
 NVCOMP_PIPELINE_DEPTH = 2
 
@@ -29,6 +29,7 @@ class WeightUpdateHeader:
     kind: WeightUpdateKind
     base_step: int
     step: int
+    optimizer_start_ns: int = 0
 
 
 def encode_weight_update_header(header: WeightUpdateHeader, *, device: torch.device | str | int) -> Tensor:
@@ -38,6 +39,8 @@ def encode_weight_update_header(header: WeightUpdateHeader, *, device: torch.dev
         )
     if header.kind == WeightUpdateKind.FULL and header.base_step != -1:
         raise ValueError(f"full update header must use base_step=-1, got {header.base_step}")
+    if header.optimizer_start_ns < 0:
+        raise ValueError(f"optimizer_start_ns must be non-negative, got {header.optimizer_start_ns}")
     return torch.tensor(
         [
             NCCL_DELTA_PROTOCOL_MAGIC,
@@ -45,6 +48,7 @@ def encode_weight_update_header(header: WeightUpdateHeader, *, device: torch.dev
             int(header.kind),
             header.base_step,
             header.step,
+            header.optimizer_start_ns,
         ],
         dtype=torch.long,
         device=device,
@@ -52,9 +56,9 @@ def encode_weight_update_header(header: WeightUpdateHeader, *, device: torch.dev
 
 
 def decode_weight_update_header(values: Tensor) -> WeightUpdateHeader:
-    if values.dtype != torch.long or values.shape != (5,):
+    if values.dtype != torch.long or values.shape != (6,):
         raise ValueError(f"invalid NCCL update header tensor: dtype={values.dtype}, shape={tuple(values.shape)}")
-    magic, version, kind, base_step, step = (int(value) for value in values.tolist())
+    magic, version, kind, base_step, step, optimizer_start_ns = (int(value) for value in values.tolist())
     if magic != NCCL_DELTA_PROTOCOL_MAGIC:
         raise ValueError(f"invalid NCCL delta protocol magic: {magic:#x}")
     if version != NCCL_DELTA_PROTOCOL_VERSION:
@@ -63,7 +67,7 @@ def decode_weight_update_header(values: Tensor) -> WeightUpdateHeader:
         update_kind = WeightUpdateKind(kind)
     except ValueError as error:
         raise ValueError(f"unsupported NCCL weight update kind: {kind}") from error
-    header = WeightUpdateHeader(update_kind, base_step, step)
+    header = WeightUpdateHeader(update_kind, base_step, step, optimizer_start_ns)
     encode_weight_update_header(header, device="cpu")
     return header
 

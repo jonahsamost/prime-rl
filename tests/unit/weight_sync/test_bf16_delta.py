@@ -299,8 +299,8 @@ def test_encoder_rejects_non_bf16_and_invalid_versions():
 @pytest.mark.parametrize(
     "header",
     [
-        WeightUpdateHeader(WeightUpdateKind.FULL, base_step=-1, step=7),
-        WeightUpdateHeader(WeightUpdateKind.BF16_XOR, base_step=7, step=8),
+        WeightUpdateHeader(WeightUpdateKind.FULL, base_step=-1, step=7, optimizer_start_ns=123456789),
+        WeightUpdateHeader(WeightUpdateKind.BF16_XOR, base_step=7, step=8, optimizer_start_ns=123456789),
     ],
 )
 def test_update_header_round_trip(header: WeightUpdateHeader):
@@ -310,6 +310,12 @@ def test_update_header_round_trip(header: WeightUpdateHeader):
 
 
 def test_update_header_rejects_malformed_or_nonconsecutive_values():
+    with pytest.raises(ValueError, match="optimizer_start_ns must be non-negative"):
+        encode_weight_update_header(
+            WeightUpdateHeader(WeightUpdateKind.FULL, base_step=-1, step=2, optimizer_start_ns=-1),
+            device="cpu",
+        )
+
     with pytest.raises(ValueError, match="consecutive versions"):
         encode_weight_update_header(
             WeightUpdateHeader(WeightUpdateKind.BF16_XOR, base_step=2, step=4),
