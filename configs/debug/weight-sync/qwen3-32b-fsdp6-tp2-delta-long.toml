@@ -1,4 +1,4 @@
-max_steps = 6
+max_steps = 22
 seq_len = 256
 
 [model]
@@ -19,8 +19,8 @@ lr = 3e-6
 batch_size = 8
 group_size = 4
 
-# Keep uniform-reward groups so the weight-sync smoke always reaches an
-# optimizer step instead of terminating after consecutive empty batches.
+# Keep uniform-reward groups so the weight-sync benchmark always reaches the
+# configured optimizer and policy-update count.
 [[orchestrator.post_batch_filters]]
 type = "zero_advantage"
 enforce = false
@@ -57,7 +57,7 @@ dp = 1
 [weight_broadcast]
 type = "nccl"
 delta_mode = "bf16_xor"
-delta_adam_bucket_mb = 2048
+delta_adam_bucket_mb = 1024
 
 [weight_broadcast.profiling]
 sample_interval_ms = 5

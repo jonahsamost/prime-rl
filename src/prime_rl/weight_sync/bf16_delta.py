@@ -16,7 +16,7 @@ from prime_rl.weight_sync.profiling import WeightSyncMetrics, cuda_event_pair
 NCCL_DELTA_PROTOCOL_MAGIC = 0x50524C44  # "PRLD"
 NCCL_DELTA_PROTOCOL_VERSION = 7
 NVCOMP_FRAME_ALIGNMENT = 256
-NVCOMP_PIPELINE_DEPTH = 2
+NVCOMP_PIPELINE_DEPTH = 6
 
 
 class WeightUpdateKind(IntEnum):
