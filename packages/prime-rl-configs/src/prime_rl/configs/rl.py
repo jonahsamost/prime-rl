@@ -129,11 +129,6 @@ class SharedInMemoryWeightBroadcastConfig(BaseConfig):
     """Timeout in seconds for in-memory weight transfer."""
 
 
-class SharedWeightSyncProfilingConfig(BaseConfig):
-    sample_interval_ms: float = Field(5.0, gt=0)
-    """Interval for sampling GPU, pinned-host, and process memory during weight synchronization."""
-
-
 class SharedNCCLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
     type: Literal["nccl"] = "nccl"
 
@@ -152,8 +147,8 @@ class SharedNCCLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
     An individually larger parameter stands alone.
     """
 
-    profiling: SharedWeightSyncProfilingConfig | None = None
-    """Opt-in detailed timing and memory profiling for full and delta weight updates."""
+    delta_pipeline_depth: int = Field(2, ge=1)
+    """Maximum number of nvCOMP encode batches in flight."""
 
 
 class SharedNIXLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
@@ -459,11 +454,7 @@ class RLConfig(BaseConfig):
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
                     delta_mode=self.weight_broadcast.delta_mode,
                     delta_adam_bucket_mb=self.weight_broadcast.delta_adam_bucket_mb,
-                    profiling=(
-                        self.weight_broadcast.profiling.model_dump()
-                        if self.weight_broadcast.profiling is not None
-                        else None
-                    ),
+                    delta_pipeline_depth=self.weight_broadcast.delta_pipeline_depth,
                 )
                 trainer_config_type = TrainerNCCLWeightBroadcastConfig
                 orchestrator_config_type = OrchestratorNCCLWeightBroadcastConfig

@@ -13,7 +13,6 @@ from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.sign_sgd import SignSGD
 from prime_rl.utils.logger import get_logger
-from prime_rl.weight_sync.profiling import cuda_event_pair, elapsed_cuda_ms
 
 
 class CPUOffloadOptimizer:
@@ -60,45 +59,19 @@ class CPUOffloadOptimizer:
         # First step initializes states on GPU - offload after
         if not self._initialized:
             result = self.optimizer.step(closure)
-            d2h_events = cuda_event_pair() if self._profiling_enabled else None
-            if d2h_events is not None:
-                d2h_events[0].record()
             self._move_states("cpu")
-            if d2h_events is not None:
-                d2h_events[1].record()
-                self.optimizer.add_optimizer_offload_timings(d2h_ms=elapsed_cuda_ms(d2h_events))
             self._initialized = True
             return result
 
         # Move states to GPU
-        h2d_events = cuda_event_pair() if self._profiling_enabled else None
-        if h2d_events is not None:
-            h2d_events[0].record()
         self._move_states("cuda")
-        if h2d_events is not None:
-            h2d_events[1].record()
 
         # Run optimizer step
         result = self.optimizer.step(closure)
-        h2d_ms = elapsed_cuda_ms(h2d_events) if h2d_events is not None else 0.0
-
         # Move states back to CPU
-        d2h_events = cuda_event_pair() if self._profiling_enabled else None
-        if d2h_events is not None:
-            d2h_events[0].record()
         self._move_states("cpu")
-        if d2h_events is not None:
-            d2h_events[1].record()
-            self.optimizer.add_optimizer_offload_timings(
-                h2d_ms=h2d_ms,
-                d2h_ms=elapsed_cuda_ms(d2h_events),
-            )
 
         return result
-
-    @property
-    def _profiling_enabled(self) -> bool:
-        return isinstance(self.optimizer, DeltaAdamW) and self.optimizer.profiling_enabled
 
     def zero_grad(self, set_to_none: bool = True):
         self.optimizer.zero_grad(set_to_none=set_to_none)
@@ -151,8 +124,8 @@ def setup_optimizer(
     lora: bool = False,
     cpu_offload: bool = False,
     delta_mode: str = "none",
-    profiling_sample_interval_ms: float | None = None,
     delta_adam_bucket_mb: int = 256,
+    delta_pipeline_depth: int = 2,
 ) -> Optimizer | CPUOffloadOptimizer:
     if delta_mode != "none" and config.type != "adamw":
         raise ValueError(f"delta mode {delta_mode!r} requires AdamW, got {config.type!r}")
@@ -168,8 +141,8 @@ def setup_optimizer(
         named_params,
         parallel_dims,
         delta_mode=delta_mode,
-        profiling_sample_interval_ms=profiling_sample_interval_ms,
         delta_adam_bucket_mb=delta_adam_bucket_mb,
+        delta_pipeline_depth=delta_pipeline_depth,
     )
 
     if cpu_offload:
@@ -185,8 +158,8 @@ def _create_optimizer(
     parallel_dims: ParallelDims,
     lr: float | None = None,
     delta_mode: str = "none",
-    profiling_sample_interval_ms: float | None = None,
     delta_adam_bucket_mb: int = 256,
+    delta_pipeline_depth: int = 2,
 ) -> Optimizer:
     """Create optimizer. If lr is None, uses config.lr."""
     if lr is None:
@@ -212,8 +185,8 @@ def _create_optimizer(
                     lr=lr,
                     weight_decay=config.weight_decay,
                     betas=(config.betas1, config.betas2),
-                    profiling_sample_interval_ms=profiling_sample_interval_ms,
                     delta_adam_bucket_bytes=delta_adam_bucket_mb * 1024 * 1024,
+                    delta_pipeline_depth=delta_pipeline_depth,
                 )
             return AdamW(
                 params=trainable_params,

@@ -504,8 +504,8 @@ class NIXLWeightUpdateWorker(Worker):
         return pulls
 
     @torch.no_grad()
-    def update_weights_from_path(self, weight_dir: str | None = None, requested_step: int = -1) -> None:
-        del weight_dir, requested_step
+    def update_weights_from_path(self, weight_dir: str | None = None) -> None:
+        del weight_dir
         plan = self.initialize_transfer()
         self.model_express.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
         self.model_express.wait_for(

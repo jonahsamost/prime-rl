@@ -536,11 +536,6 @@ class InMemoryWeightBroadcastConfig(BaseWeightBroadcastConfig):
     """Number of inference workers."""
 
 
-class WeightSyncProfilingConfig(BaseConfig):
-    sample_interval_ms: float = Field(5.0, gt=0)
-    """Interval for sampling GPU, pinned-host, and process memory during weight synchronization."""
-
-
 class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     type: Literal["nccl"] = "nccl"
 
@@ -563,8 +558,8 @@ class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     An individually larger parameter stands alone.
     """
 
-    profiling: WeightSyncProfilingConfig | None = None
-    """Opt-in detailed timing and memory profiling for full and delta weight updates."""
+    delta_pipeline_depth: int = Field(2, ge=1)
+    """Maximum number of nvCOMP encode batches in flight."""
 
 
 class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):

@@ -1,22 +1,18 @@
 from __future__ import annotations
 
-import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import IntEnum
 from math import prod
-from typing import Any, Iterable, Iterator, Sequence
+from typing import Any, Iterator, Sequence
 
 import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 
-from prime_rl.weight_sync.profiling import WeightSyncMetrics, cuda_event_pair
-
 NCCL_DELTA_PROTOCOL_MAGIC = 0x50524C44  # "PRLD"
-NCCL_DELTA_PROTOCOL_VERSION = 7
 NVCOMP_FRAME_ALIGNMENT = 256
-NVCOMP_PIPELINE_DEPTH = 6
+DEFAULT_NVCOMP_PIPELINE_DEPTH = 2
 
 
 class WeightUpdateKind(IntEnum):
@@ -44,7 +40,6 @@ def encode_weight_update_header(header: WeightUpdateHeader, *, device: torch.dev
     return torch.tensor(
         [
             NCCL_DELTA_PROTOCOL_MAGIC,
-            NCCL_DELTA_PROTOCOL_VERSION,
             int(header.kind),
             header.base_step,
             header.step,
@@ -56,13 +51,11 @@ def encode_weight_update_header(header: WeightUpdateHeader, *, device: torch.dev
 
 
 def decode_weight_update_header(values: Tensor) -> WeightUpdateHeader:
-    if values.dtype != torch.long or values.shape != (6,):
+    if values.dtype != torch.long or values.shape != (5,):
         raise ValueError(f"invalid NCCL update header tensor: dtype={values.dtype}, shape={tuple(values.shape)}")
-    magic, version, kind, base_step, step, optimizer_start_ns = (int(value) for value in values.tolist())
+    magic, kind, base_step, step, optimizer_start_ns = (int(value) for value in values.tolist())
     if magic != NCCL_DELTA_PROTOCOL_MAGIC:
         raise ValueError(f"invalid NCCL delta protocol magic: {magic:#x}")
-    if version != NCCL_DELTA_PROTOCOL_VERSION:
-        raise ValueError(f"unsupported NCCL delta protocol version {version}; expected {NCCL_DELTA_PROTOCOL_VERSION}")
     try:
         update_kind = WeightUpdateKind(kind)
     except ValueError as error:
@@ -100,16 +93,9 @@ class CompressedDeltaFrame:
 
 
 @dataclass(frozen=True)
-class NvcompEncodeEvents:
-    encode: tuple[torch.cuda.Event, torch.cuda.Event]
-    clone: tuple[torch.cuda.Event, torch.cuda.Event]
-
-
-@dataclass(frozen=True)
 class PendingNvcompEncode:
     output_buffers: tuple[Tensor, ...]
     encoded: tuple[Any, ...]
-    events: NvcompEncodeEvents | None
 
 
 @dataclass(frozen=True)
@@ -129,7 +115,6 @@ class BF16DeltaUpdate:
     tensors: tuple[DeltaTensorMetadata, ...]
     frames: tuple[CompressedDeltaFrame, ...]
     payload: Tensor
-    profile: WeightSyncMetrics | None = field(default=None, compare=False, repr=False)
 
     @property
     def uncompressed_nbytes(self) -> int:
@@ -158,7 +143,6 @@ class ShardedBF16DeltaUpdate:
     base_step: int
     step: int
     shards: tuple[BF16DeltaUpdate, ...]
-    profile: WeightSyncMetrics | None = field(default=None, compare=False, repr=False)
 
     @property
     def uncompressed_nbytes(self) -> int:
@@ -216,19 +200,14 @@ class NvcompLZ4Codec:
     def encode(
         self,
         values: Sequence[Tensor],
-        *,
-        profile: WeightSyncMetrics | None = None,
-    ) -> tuple[list[Tensor], NvcompEncodeEvents | None]:
+    ) -> list[Tensor]:
         if not values:
-            return [], None
-        pending = self.submit_encode(values, profile=profile)
-        return self.finalize_encode(pending, profile=profile)
+            return []
+        return self.finalize_encode(self.submit_encode(values))
 
     def submit_encode(
         self,
         values: Sequence[Tensor],
-        *,
-        profile: WeightSyncMetrics | None = None,
     ) -> PendingNvcompEncode:
         if not values:
             raise ValueError("cannot submit an empty nvCOMP encode batch")
@@ -239,17 +218,8 @@ class NvcompLZ4Codec:
         for value in values:
             value.record_stream(self.stream)
 
-        events = (
-            NvcompEncodeEvents(
-                encode=cuda_event_pair(),
-                clone=cuda_event_pair(),
-            )
-            if profile is not None
-            else None
-        )
         with torch.cuda.stream(self.stream):
             sources = self.nvcomp.as_arrays(byte_views, cuda_stream=self.stream.cuda_stream)
-            output_alloc_start = time.perf_counter()
             output_buffers = [
                 torch.empty(
                     self.codec.get_max_comp_buffer_size(source),
@@ -258,90 +228,58 @@ class NvcompLZ4Codec:
                 )
                 for source in sources
             ]
-            if profile is not None:
-                profile.nvcomp_output_alloc_wall_ms += (time.perf_counter() - output_alloc_start) * 1000
             destinations = self.nvcomp.as_arrays(output_buffers, cuda_stream=self.stream.cuda_stream)
             compression_config = self._compression_config(sizes)
-            if events is not None:
-                events.encode[0].record(self.stream)
-            encode_call_start = time.perf_counter()
             encoded = self.codec.encode(
                 sources,
                 out=destinations,
                 compression_config=compression_config,
             )
-            if events is not None:
-                events.encode[1].record(self.stream)
-            if profile is not None:
-                profile.nvcomp_encode_call_wall_ms += (time.perf_counter() - encode_call_start) * 1000
 
         return PendingNvcompEncode(
             output_buffers=tuple(output_buffers),
             encoded=tuple(encoded),
-            events=events,
         )
 
     def finalize_encode(
         self,
         pending: PendingNvcompEncode,
-        *,
-        profile: WeightSyncMetrics | None = None,
-    ) -> tuple[list[Tensor], NvcompEncodeEvents | None]:
-        events = pending.events
+    ) -> list[Tensor]:
         with torch.cuda.stream(self.stream):
-            size_read_start = time.perf_counter()
             compressed_sizes = [item.buffer_size for item in pending.encoded]
-            if profile is not None:
-                profile.nvcomp_buffer_size_read_wall_ms += (time.perf_counter() - size_read_start) * 1000
             # Keep Torch as the allocator/owner. Converting nvCOMP-owned output
             # arrays through DLPack and then dropping their wrappers can leave
             # Torch tensors referring to released storage. Clone only the valid
             # compressed range so the worst-case output buffers remain bounded
             # to the current Adam bucket instead of accumulating for the model.
-            clone_enqueue_start = time.perf_counter()
-            if events is not None:
-                events.clone[0].record(self.stream)
             payloads = [
                 buffer.narrow(0, 0, compressed_size).clone()
                 for buffer, compressed_size in zip(pending.output_buffers, compressed_sizes, strict=True)
             ]
-            if events is not None:
-                events.clone[1].record(self.stream)
-            if profile is not None:
-                profile.nvcomp_clone_enqueue_wall_ms += (time.perf_counter() - clone_enqueue_start) * 1000
-        return payloads, events
+        return payloads
 
     def pack(
         self,
         payloads: Sequence[Tensor],
-        *,
-        profile: bool = False,
-    ) -> tuple[Tensor, tuple[torch.cuda.Event, torch.cuda.Event] | None]:
+    ) -> Tensor:
         if not payloads:
-            return torch.empty(0, dtype=torch.uint8, device=self.device), None
-        events = cuda_event_pair() if profile else None
+            return torch.empty(0, dtype=torch.uint8, device=self.device)
         with torch.cuda.stream(self.stream):
-            if events is not None:
-                events[0].record(self.stream)
             packed = torch.empty(_packed_nbytes(payloads), dtype=torch.uint8, device=self.device)
             offset = 0
             for payload in payloads:
                 offset = _align_up(offset, NVCOMP_FRAME_ALIGNMENT)
                 packed.narrow(0, offset, payload.numel()).copy_(payload)
                 offset += payload.numel()
-            if events is not None:
-                events[1].record(self.stream)
-        return packed, events
+        return packed
 
     def decode(
         self,
         payloads: Sequence[Tensor],
         uncompressed_nbytes: Sequence[int],
-        *,
-        profile: bool = False,
-    ) -> tuple[list[Tensor], tuple[torch.cuda.Event, torch.cuda.Event] | None]:
+    ) -> list[Tensor]:
         if not payloads:
-            return [], None
+            return []
         sizes = tuple(uncompressed_nbytes)
         if len(payloads) != len(sizes):
             raise ValueError(f"received {len(payloads)} compressed frames for {len(sizes)} output sizes")
@@ -350,23 +288,18 @@ class NvcompLZ4Codec:
         for payload in payloads:
             payload.record_stream(self.stream)
 
-        events = cuda_event_pair() if profile else None
         with torch.cuda.stream(self.stream):
             outputs = [torch.empty(size, dtype=torch.uint8, device=self.device) for size in sizes]
             sources = self.nvcomp.as_arrays(payloads, cuda_stream=self.stream.cuda_stream)
             destinations = self.nvcomp.as_arrays(outputs, cuda_stream=self.stream.cuda_stream)
             decompression_config = self._decompression_config(sizes, sources)
-            if events is not None:
-                events[0].record(self.stream)
             self.codec.decode(
                 sources,
                 out=destinations,
                 decompression_config=decompression_config,
             )
-            if events is not None:
-                events[1].record(self.stream)
         consumer_stream.wait_stream(self.stream)
-        return outputs, events
+        return outputs
 
     def synchronize(self) -> None:
         self.stream.synchronize()
@@ -406,20 +339,20 @@ class BF16DeltaEncoder:
         base_step: int,
         step: int,
         codec: NvcompLZ4Codec,
-        profile: WeightSyncMetrics | None = None,
+        pipeline_depth: int = DEFAULT_NVCOMP_PIPELINE_DEPTH,
     ) -> None:
         if step != base_step + 1:
             raise ValueError(f"BF16 delta updates must be consecutive: base_step={base_step}, step={step}")
         self.base_step = base_step
         self.step = step
         self.codec = codec
-        self.profile = profile
+        if pipeline_depth < 1:
+            raise ValueError(f"delta pipeline depth must be positive, got {pipeline_depth}")
+        self.pipeline_depth = pipeline_depth
         self._tensors: list[DeltaTensorMetadata] = []
         self._frames: list[CompressedDeltaFrame] = []
         self._payloads: list[Tensor] = []
         self._pending: deque[PendingDeltaFrame] = deque()
-        self._compression_events: list[NvcompEncodeEvents] = []
-        self._compression_started_at: float | None = None
         self._finished = False
 
     def append(self, name: str, delta: Tensor) -> None:
@@ -486,9 +419,7 @@ class BF16DeltaEncoder:
         if global_shapes is None:
             global_shapes = [tuple(value.shape) for _, value in normalized]
         if len(global_shapes) != len(normalized):
-            raise ValueError(
-                f"received {len(global_shapes)} global shapes for {len(normalized)} BF16 delta tensors"
-            )
+            raise ValueError(f"received {len(global_shapes)} global shapes for {len(normalized)} BF16 delta tensors")
         if shard_descriptors is None:
             shard_descriptors = [(shard_dim, shard_index, shard_count)] * len(normalized)
         if len(shard_descriptors) != len(normalized):
@@ -514,30 +445,15 @@ class BF16DeltaEncoder:
         )
         first_tensor_index = len(self._tensors)
         self._tensors.extend(metadata)
-        if self.profile is not None:
-            largest_metadata_bytes = max(item.nbytes for item in metadata)
-            self.profile.largest_tensor_bytes = max(
-                self.profile.largest_tensor_bytes,
-                largest_metadata_bytes,
-            )
-
-        if self._compression_started_at is None:
-            self._compression_started_at = time.perf_counter()
         self._pending.append(
             PendingDeltaFrame(
                 first_tensor_index=first_tensor_index,
                 tensor_count=len(metadata),
                 uncompressed_nbytes=bucket.numel() * bucket.element_size(),
-                encode=self.codec.submit_encode([bucket], profile=self.profile),
+                encode=self.codec.submit_encode([bucket]),
             )
         )
-        if self.profile is not None:
-            self.profile.nvcomp_batch_count += 1
-            self.profile.nvcomp_peak_pending_batches = max(
-                self.profile.nvcomp_peak_pending_batches,
-                len(self._pending),
-            )
-        if len(self._pending) >= NVCOMP_PIPELINE_DEPTH:
+        if len(self._pending) >= self.pipeline_depth:
             self._finalize_oldest()
 
     def finish(self) -> BF16DeltaUpdate:
@@ -546,7 +462,7 @@ class BF16DeltaEncoder:
         self._finished = True
         while self._pending:
             self._finalize_oldest()
-        packed, pack_events = self.codec.pack(self._payloads, profile=self.profile is not None)
+        packed = self.codec.pack(self._payloads)
         self.codec.synchronize()
         update = BF16DeltaUpdate(
             base_step=self.base_step,
@@ -554,27 +470,8 @@ class BF16DeltaEncoder:
             tensors=tuple(self._tensors),
             frames=tuple(self._frames),
             payload=packed,
-            profile=self.profile,
         )
         validate_delta_update(update)
-        if self.profile is not None:
-            encode_gpu_ms = _sum_completed_events(
-                events.encode for events in self._compression_events
-            )
-            clone_gpu_ms = _sum_completed_events(
-                events.clone for events in self._compression_events
-            )
-            self.profile.nvcomp_encode_gpu_ms += encode_gpu_ms
-            self.profile.nvcomp_clone_gpu_ms += clone_gpu_ms
-            self.profile.nvcomp_compress_gpu_ms += encode_gpu_ms + clone_gpu_ms
-            if pack_events is not None:
-                self.profile.delta_gpu_pack_ms += pack_events[0].elapsed_time(pack_events[1])
-            if self._compression_started_at is not None:
-                self.profile.nvcomp_compress_wall_ms += (time.perf_counter() - self._compression_started_at) * 1000
-            self.profile.raw_bytes = update.uncompressed_nbytes
-            self.profile.compressed_bytes = update.compressed_nbytes
-            self.profile.tensor_count = len(update.tensors)
-            self.profile.frame_count = len(update.frames)
         return update
 
     def abort(self) -> None:
@@ -584,7 +481,7 @@ class BF16DeltaEncoder:
 
     def _finalize_oldest(self) -> None:
         pending = self._pending.popleft()
-        payloads, events = self.codec.finalize_encode(pending.encode, profile=self.profile)
+        payloads = self.codec.finalize_encode(pending.encode)
         if len(payloads) != 1:
             raise RuntimeError(f"nvCOMP returned {len(payloads)} frames for one BF16 delta bucket")
         payload = payloads[0]
@@ -597,8 +494,6 @@ class BF16DeltaEncoder:
             )
         )
         self._payloads.append(payload)
-        if events is not None:
-            self._compression_events.append(events)
 
     @staticmethod
     def _normalize_values(values: Sequence[tuple[str, Tensor]]) -> list[tuple[str, Tensor]]:
@@ -622,17 +517,12 @@ def decode_delta_tensors(
     tensors: Sequence[DeltaTensorMetadata],
     frames: Sequence[CompressedDeltaFrame],
     payloads: Sequence[Tensor],
-    *,
-    profile: bool = False,
-) -> tuple[list[tuple[str, Tensor]], tuple[torch.cuda.Event, torch.cuda.Event] | None]:
+) -> list[tuple[str, Tensor]]:
     if len(frames) != len(payloads):
-        raise ValueError(
-            f"delta decode length mismatch: frames={len(frames)}, payloads={len(payloads)}"
-        )
-    decoded, events = codec.decode(
+        raise ValueError(f"delta decode length mismatch: frames={len(frames)}, payloads={len(payloads)}")
+    decoded = codec.decode(
         payloads,
         [frame.uncompressed_nbytes for frame in frames],
-        profile=profile,
     )
     values: list[tuple[str, Tensor]] = []
     for frame, raw in zip(frames, decoded, strict=True):
@@ -646,7 +536,7 @@ def decode_delta_tensors(
             raise ValueError(
                 f"decoded BF16 delta frame describes {offset} tensor bytes; expected {frame.uncompressed_nbytes}"
             )
-    return values, events
+    return values
 
 
 def validate_delta_update(update: BF16DeltaUpdate) -> None:
@@ -660,8 +550,7 @@ def validate_delta_update(update: BF16DeltaUpdate) -> None:
         )
     if update.payload.data_ptr() % NVCOMP_FRAME_ALIGNMENT != 0:
         raise ValueError(
-            f"BF16 delta payload address {update.payload.data_ptr():#x} is not "
-            f"{NVCOMP_FRAME_ALIGNMENT}-byte aligned"
+            f"BF16 delta payload address {update.payload.data_ptr():#x} is not {NVCOMP_FRAME_ALIGNMENT}-byte aligned"
         )
     names: set[str] = set()
     for tensor in update.tensors:
@@ -677,9 +566,7 @@ def validate_delta_update(update: BF16DeltaUpdate) -> None:
                 f"{tensor.name} local rank {len(tensor.shape)} does not match global rank {len(global_shape)}"
             )
         if tensor.shard_count <= 0 or not 0 <= tensor.shard_index < tensor.shard_count:
-            raise ValueError(
-                f"{tensor.name} has invalid shard {tensor.shard_index}/{tensor.shard_count}"
-            )
+            raise ValueError(f"{tensor.name} has invalid shard {tensor.shard_index}/{tensor.shard_count}")
         if tensor.shard_count == 1:
             if tensor.shard_dim is not None or tensor.shape != global_shape:
                 raise ValueError(f"unsharded tensor {tensor.name} must have identical local and global shapes")
@@ -764,9 +651,7 @@ def validate_sharded_delta_update(update: ShardedBF16DeltaUpdate) -> None:
             raise ValueError(f"{pieces[0].name} shard trailing dimensions do not match its global shape")
         reconstructed = (sum(piece.shape[0] for piece in pieces), *global_shape[1:])
         if reconstructed != global_shape:
-            raise ValueError(
-                f"{pieces[0].name} shards reconstruct shape {reconstructed}; expected {global_shape}"
-            )
+            raise ValueError(f"{pieces[0].name} shards reconstruct shape {reconstructed}; expected {global_shape}")
 
 
 def reconstruct_delta_tensors(
@@ -821,10 +706,6 @@ def reconstruct_delta_tensors(
             raise ValueError(f"{names[0]} reconstructed shape {tuple(value.shape)}; expected {global_shape}")
         reconstructed.append((names[0], value))
     return reconstructed
-
-
-def _sum_completed_events(events: Iterable[tuple[torch.cuda.Event, torch.cuda.Event]]) -> float:
-    return sum(start.elapsed_time(end) for start, end in events)
 
 
 def _align_up(value: int, alignment: int) -> int:

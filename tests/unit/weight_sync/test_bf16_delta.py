@@ -18,7 +18,6 @@ from prime_rl.weight_sync.bf16_delta import (
     reconstruct_delta_tensors,
     validate_sharded_delta_update,
 )
-from prime_rl.weight_sync.profiling import WeightSyncMetrics
 
 pytestmark = [pytest.mark.gpu]
 
@@ -29,7 +28,7 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
 
 def _decode_update(update) -> dict[str, torch.Tensor]:
     decoder = NvcompLZ4Codec(update.payload.device)
-    decoded, _events = decode_delta_tensors(
+    decoded = decode_delta_tensors(
         decoder,
         update.tensors,
         update.frames,
@@ -47,12 +46,11 @@ def test_nvcomp_lz4_cuda_encode_decode_round_trip_is_byte_exact():
     delta = torch.bitwise_xor(old, new).view(torch.bfloat16)
     second_delta = torch.bitwise_xor(old[:256], new[:256]).view(torch.bfloat16)
     third_delta = torch.bitwise_xor(old[256:384], new[256:384]).view(torch.bfloat16)
-    profile = WeightSyncMetrics()
     encoder = BF16DeltaEncoder(
         base_step=4,
         step=5,
         codec=NvcompLZ4Codec(device),
-        profile=profile,
+        pipeline_depth=2,
     )
 
     encoder.append_batch([("weight", delta), ("second_weight", second_delta)])
@@ -72,22 +70,6 @@ def test_nvcomp_lz4_cuda_encode_decode_round_trip_is_byte_exact():
     assert update.frames[1].tensor_count == 1
     assert update.payload.numel() == packed_delta_nbytes(update.frames)
     assert all(payload.data_ptr() % 256 == 0 for payload in update.frame_payloads())
-    assert profile.raw_bytes == (delta.numel() + second_delta.numel() + third_delta.numel()) * delta.element_size()
-    assert profile.compressed_bytes == update.compressed_nbytes
-    assert profile.nvcomp_batch_count == 2
-    assert profile.nvcomp_peak_pending_batches == 2
-    assert profile.frame_count == 2
-    assert profile.nvcomp_compress_gpu_ms > 0
-    assert profile.nvcomp_encode_gpu_ms > 0
-    assert profile.nvcomp_clone_gpu_ms > 0
-    assert profile.nvcomp_compress_gpu_ms == pytest.approx(
-        profile.nvcomp_encode_gpu_ms + profile.nvcomp_clone_gpu_ms
-    )
-    assert profile.nvcomp_compress_wall_ms > 0
-    assert profile.nvcomp_output_alloc_wall_ms > 0
-    assert profile.nvcomp_encode_call_wall_ms > 0
-    assert profile.nvcomp_buffer_size_read_wall_ms >= 0
-    assert profile.nvcomp_clone_enqueue_wall_ms > 0
     assert torch.equal(_bits(decoded["weight"]), _bits(delta))
     assert torch.equal(_bits(decoded["second_weight"]), _bits(second_delta))
     assert torch.equal(_bits(decoded["third_weight"]), _bits(third_delta))
@@ -124,7 +106,7 @@ def test_four_compressed_dimension_zero_shards_reconstruct_byte_exactly():
     metadata_shards = []
     for update in distributed.shards:
         codec = NvcompLZ4Codec(device)
-        decoded, _events = decode_delta_tensors(
+        decoded = decode_delta_tensors(
             codec,
             update.tensors,
             update.frames,
@@ -155,9 +137,7 @@ def test_distributed_delta_rejects_a_missing_trainer_shard():
         updates.append(encoder.finish())
 
     with pytest.raises(ValueError, match="expected 0/3|expected 1/3|expected 2/3"):
-        validate_sharded_delta_update(
-            ShardedBF16DeltaUpdate(base_step=1, step=2, shards=tuple(updates))
-        )
+        validate_sharded_delta_update(ShardedBF16DeltaUpdate(base_step=1, step=2, shards=tuple(updates)))
 
 
 def test_distributed_delta_rejects_divergent_frame_manifests():
@@ -196,9 +176,7 @@ def test_distributed_delta_rejects_divergent_frame_manifests():
         updates.append(encoder.finish())
 
     with pytest.raises(ValueError, match="incompatible tensor/frame manifest"):
-        validate_sharded_delta_update(
-            ShardedBF16DeltaUpdate(base_step=3, step=4, shards=tuple(updates))
-        )
+        validate_sharded_delta_update(ShardedBF16DeltaUpdate(base_step=3, step=4, shards=tuple(updates)))
 
 
 def test_distributed_delta_supports_repeated_unsharded_metadata():
@@ -282,7 +260,7 @@ def test_delta_adamw_matches_adamw_and_emits_exact_parameter_xor():
         assert torch.equal(delta_state["exp_avg_sq"], reference_state["exp_avg_sq"])
 
 
-def test_encoder_rejects_non_bf16_and_invalid_versions():
+def test_encoder_rejects_non_bf16_and_nonconsecutive_steps():
     device = torch.device("cuda", torch.cuda.current_device())
     codec = NvcompLZ4Codec(device)
     with pytest.raises(ValueError, match="must be consecutive"):
@@ -334,6 +312,6 @@ def test_update_header_rejects_malformed_or_nonconsecutive_values():
         WeightUpdateHeader(WeightUpdateKind.FULL, base_step=-1, step=2),
         device="cpu",
     )
-    encoded[1] -= 1
-    with pytest.raises(ValueError, match="protocol version"):
+    encoded[1] = 99
+    with pytest.raises(ValueError, match="weight update kind"):
         decode_weight_update_header(encoded)

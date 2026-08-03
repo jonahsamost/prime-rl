@@ -57,10 +57,8 @@ dp = 1
 [weight_broadcast]
 type = "nccl"
 delta_mode = "bf16_xor"
-delta_adam_bucket_mb = 2048
-
-[weight_broadcast.profiling]
-sample_interval_ms = 5
+delta_adam_bucket_mb = 256
+delta_pipeline_depth = 2
 
 [deployment]
 type = "single_node"

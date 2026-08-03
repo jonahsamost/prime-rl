@@ -548,7 +548,7 @@ def test_bf16_xor_weight_transfer_propagates_to_nccl_components():
                 "type": "nccl",
                 "delta_mode": "bf16_xor",
                 "delta_adam_bucket_mb": 192,
-                "profiling": {"sample_interval_ms": 2.5},
+                "delta_pipeline_depth": 3,
             },
             "trainer": {"model": {"optimization_dtype": "bfloat16"}},
             "orchestrator": {"renderer": {"name": "default"}},
@@ -559,13 +559,11 @@ def test_bf16_xor_weight_transfer_propagates_to_nccl_components():
     assert config.trainer.weight_broadcast.type == "nccl"
     assert config.trainer.weight_broadcast.delta_mode == "bf16_xor"
     assert config.trainer.weight_broadcast.delta_adam_bucket_mb == 192
-    assert config.trainer.weight_broadcast.profiling is not None
-    assert config.trainer.weight_broadcast.profiling.sample_interval_ms == 2.5
+    assert config.trainer.weight_broadcast.delta_pipeline_depth == 3
     assert config.orchestrator.weight_broadcast.type == "nccl"
     assert config.orchestrator.weight_broadcast.delta_mode == "bf16_xor"
     assert config.orchestrator.weight_broadcast.delta_adam_bucket_mb == 192
-    assert config.orchestrator.weight_broadcast.profiling is not None
-    assert config.orchestrator.weight_broadcast.profiling.sample_interval_ms == 2.5
+    assert config.orchestrator.weight_broadcast.delta_pipeline_depth == 3
 
 
 def test_bf16_xor_weight_transfer_rejects_quantization():

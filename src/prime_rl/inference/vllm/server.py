@@ -88,10 +88,7 @@ async def resume(request: Request):
 @router.post("/update_weights")
 async def update_weights(request: Request):
     data = await request.json()
-    await engine_client(request).collective_rpc(
-        "update_weights_from_path",
-        args=(data.get("weight_dir"), data.get("step", -1)),
-    )
+    await engine_client(request).collective_rpc("update_weights_from_path", args=(data.get("weight_dir"),))
     return {"status": "ok"}
 
 
@@ -147,12 +144,11 @@ async def init_broadcaster(request: Request):
     rank_offset = data.get("rank_offset")
     inference_world_size = data.get("inference_world_size")
     quantize_in_weight_transfer = data.get("quantize_in_weight_transfer", False)
-    delta_mode = data.get("delta_mode", "none")
-    profiling_sample_interval_ms = data.get("profiling_sample_interval_ms")
     session_id = data.get("session_id", "default")
     args = (host, port, rank_offset, inference_world_size, timeout, quantize_in_weight_transfer)
     args += (session_id,)
-    args += (delta_mode, profiling_sample_interval_ms)
+    if "delta_mode" in data:
+        args += (data["delta_mode"],)
     await engine_client(request).collective_rpc(
         "init_broadcaster",
         args=args,

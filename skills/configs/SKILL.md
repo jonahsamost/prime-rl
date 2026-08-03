@@ -112,59 +112,24 @@ optimization_dtype = "bfloat16"
 type = "nccl"
 delta_mode = "bf16_xor"
 delta_adam_bucket_mb = 256
-# Optional TP=1 smoke-test audit: trainer hashes these post-Adam BF16 tensors;
-# inference verifies the corresponding live parameters after decode/route/XOR.
-delta_audit_parameter_names = [
-  "model.layers.0.input_layernorm.weight",
-  "model.layers.0.self_attn.o_proj.weight",
-  "model.layers.0.mlp.down_proj.weight",
-  "model.norm.weight",
-]
-
-[weight_broadcast.profiling]
-sample_interval_ms = 5
+delta_pipeline_depth = 2
 ```
 
-For the complete two-GPU constraints, compose
-`configs/debug/weight-sync/bf16-xor.toml` after an RL config.
-Use `configs/debug/weight-sync/qwen3-bf16-xor-smoke.toml` for the standalone
-four-step correctness smoke run.
+Use `configs/debug/weight-sync/qwen3-32b-fsdp6-tp2-delta-smoke.toml` for the
+end-to-end Qwen3-32B smoke run.
 
-When `delta_audit_parameter_names` is non-empty, every delta carries SHA-256
-digests for those exact post-optimizer tensor bytes. The vLLM receiver hashes
-the live parameters after applying the update and raises on any mismatch. Keep
-this disabled for benchmarks: hashing copies audited tensors to CPU and is
-intentionally a correctness tool, not part of the fast path.
-
-This mode currently requires AdamW, single-run training, one trainer GPU on a
-single node, unquantized trainer and inference models, and inference TP=1.
-Configuration validation rejects other combinations. The startup update is a normal full checkpoint transfer;
+This mode currently requires dense Qwen3, AdamW, BF16, single-run training,
+`dp_replicate=1`, `cp=1`, `ep=1`, a single-node deployment, and no trainer,
+inference, or transfer quantization. Configuration validation rejects other
+combinations. The startup update is a normal full checkpoint transfer;
 later consecutive versions are source-layout XOR updates. AdamW snapshots and
 updates bounded local parameter buckets, invokes one foreach-capable AdamW update per
 bucket, and batch-compresses that bucket's parameter XOR tensors with nvCOMP LZ4
 without leaving CUDA memory. The compressed tensor streams are packed into one
-CUDA `uint8` payload and broadcast directly with NCCL. The receiver retains the
-payload on GPU, batch-decompresses one Qwen layer at a time, routes the decoded
-source-layout tensors through vLLM's loader, and applies the XOR in place. No
-delta payload, compression, or decompression path uses CPU staging.
-
-The optional `weight_broadcast.profiling` block enables structured per-update
-timing and memory metrics for both full and delta transfers. GPU operations use
-CUDA events; phase memory is sampled without resetting the trainer's global
-peak counters. Metrics cover PyTorch allocated/reserved GPU memory, device-wide
-GPU usage, pinned host memory, process RSS, optimizer and delta phases, GPU
-compression, NCCL, vLLM routing, and application. The detailed profiler adds
-synchronization and sampling overhead, so use it for benchmark runs rather than
-normal training.
-
-`nvcomp_compress_gpu_ms` sums bucket-batch LZ4 kernel time;
-`nvcomp_compress_wall_ms` spans the first submitted compression through final
-stream completion. `nvcomp_decompress_gpu_ms` sums receiver layer-batch decode
-time, `delta_gpu_pack_ms` covers packing compressed streams into the single NCCL
-payload, and `nvcomp_batch_count` reports trainer compression submissions.
-Snapshot, Adam, and XOR CUDA events are resolved only after the nvCOMP stream
-drains; `event_timing_resolve_wall_ms` measures this deferred telemetry
-cost. No per-parameter event synchronization occurs in the optimizer loop.
+CUDA `uint8` payload per trainer rank. Rank zero gathers compressed payloads and
+broadcasts them directly with NCCL. Each inference TP rank reconstructs and
+applies one Qwen layer at a time. Runtime logs report the raw/compressed byte
+ratio and optimizer-start-to-inference-apply latency.
 
 ## Key files
 

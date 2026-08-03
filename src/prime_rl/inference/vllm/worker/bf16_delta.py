@@ -12,8 +12,8 @@ TP selection, and copies), routing an XOR value produces the XOR value in the
 resident vLLM layout.
 
 This is not safe for loaders that cast, quantize, perform floating-point
-arithmetic, or otherwise transform values.  Support for a real model must be
-established by the byte-exact commutation test described in ``delta_plan.md``.
+arithmetic, or otherwise transform values. Support for a real model must be
+established by a byte-exact routing test before enabling it here.
 """
 
 from __future__ import annotations

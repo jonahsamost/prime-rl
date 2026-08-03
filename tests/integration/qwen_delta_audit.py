@@ -43,8 +43,7 @@ def audit_qwen3_bf16_delta(model: nn.Module) -> dict[str, Any]:
     }
     device = next(model.parameters()).device
     generators = {
-        name: torch.Generator(device=device).manual_seed(index)
-        for index, name in enumerate(source_shapes, start=1)
+        name: torch.Generator(device=device).manual_seed(index) for index, name in enumerate(source_shapes, start=1)
     }
     old_source = {
         name: torch.randint(

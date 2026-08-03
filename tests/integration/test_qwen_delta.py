@@ -42,11 +42,15 @@ def test_qwen3_bf16_source_xor_routes_and_applies_byte_exactly(monkeypatch: pyte
         disable_log_stats=True,
     )
 
-    assert llm.apply_model(audit_qwen3_bf16_delta) == [
-        {
-            "layer": 0,
-            "destination_parameters_checked": 8,
-            "source_tensors_checked": 11,
-            "non_layer_parameters_checked": 3,
-        }
-    ] * tensor_parallel_size
+    assert (
+        llm.apply_model(audit_qwen3_bf16_delta)
+        == [
+            {
+                "layer": 0,
+                "destination_parameters_checked": 8,
+                "source_tensors_checked": 11,
+                "non_layer_parameters_checked": 3,
+            }
+        ]
+        * tensor_parallel_size
+    )
