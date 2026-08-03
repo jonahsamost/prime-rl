@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from prime_rl.trainer.rl.broadcast.nccl import gather_compressed_delta_updates
+from prime_rl.trainer.rl.broadcast.nccl_delta import gather_compressed_delta_updates
 from prime_rl.weight_sync.bf16_delta import (
     NVCOMP_FRAME_ALIGNMENT,
     BF16DeltaEncoder,
