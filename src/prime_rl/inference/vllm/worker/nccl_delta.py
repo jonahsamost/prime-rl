@@ -55,7 +55,7 @@ class NCCLDeltaHandler:
             receive_tensor=receive_tensor,
             receive_bytes=receive_bytes,
         )
-        apply_compressed_delta(model, update, codec=self.codec, device=self.device)
+        apply_compressed_delta(model, update, codec=self.codec)
 
 
 def receive_compressed_delta(
@@ -108,7 +108,6 @@ def apply_compressed_delta(
     update: ShardedBF16DeltaUpdate,
     *,
     codec: NvcompLZ4Codec,
-    device: torch.device,
 ) -> None:
     """Decode FSDP shards and apply one reconstructed Qwen source layer at a time."""
     logger.info(
@@ -161,7 +160,6 @@ def apply_compressed_delta(
             del decoded_group
             group_start = group_end
         del decoded_shards, metadata_shards
-    torch.cuda.synchronize(device)
 
 
 def _qwen_layer_index(name: str) -> int:

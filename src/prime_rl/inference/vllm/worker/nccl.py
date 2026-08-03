@@ -136,6 +136,25 @@ class NCCLWeightBroadcastReceiver:
         return receive_update_header(self.communicator)
 
 
+def _finish_weight_update(
+    receiver: NCCLWeightBroadcastReceiver,
+    header: WeightUpdateHeader | None,
+    device: torch.device,
+) -> None:
+    """Wait for application, report end-to-end latency, and advance the resident policy version."""
+    torch.cuda.synchronize(device)
+    if header is None:
+        return
+    if header.optimizer_start_ns:
+        optimizer_to_apply_ms = (time.perf_counter_ns() - header.optimizer_start_ns) / 1_000_000
+        logger.info(
+            "Policy v%d optimizer-start to inference-apply: %.2f ms",
+            header.step,
+            optimizer_to_apply_ms,
+        )
+    receiver.current_step = header.step
+
+
 class NCCLWeightUpdateWorker(Worker):
     """vLLM worker extension for updating weights in-place using NCCL."""
 
@@ -213,40 +232,17 @@ class NCCLWeightUpdateWorker(Worker):
                 receive_tensor=_receive_tensor,
                 receive_bytes=receive_bytes,
             )
-            optimizer_to_apply_ms = (
-                (time.perf_counter_ns() - header.optimizer_start_ns) / 1_000_000 if header.optimizer_start_ns else 0.0
-            )
-            if header.optimizer_start_ns:
-                logger.info(
-                    "Policy v%d optimizer-start to inference-apply: %.2f ms",
-                    header.step,
-                    optimizer_to_apply_ms,
-                )
-            self.nccl_broadcast_receiver.current_step = header.step
-            return
-
-        state_iter = self.nccl_broadcast_receiver.receive_state_dict()
-        if self.quantize_in_weight_transfer:
-            load_weights_kernel(model, state_iter)
-            update_mla_absorbed_weights(model)
         else:
-            load_weights_checkpoint_layerwise(
-                model,
-                state_iter,
-                self.model_runner.model_config,
-                self.vllm_config,
-            )
-        torch.cuda.synchronize(self.device)
-        optimizer_to_apply_ms = (
-            (time.perf_counter_ns() - header.optimizer_start_ns) / 1_000_000
-            if header is not None and header.optimizer_start_ns
-            else 0.0
-        )
-        if header is not None and header.optimizer_start_ns:
-            logger.info(
-                "Policy v%d optimizer-start to inference-apply: %.2f ms",
-                header.step,
-                optimizer_to_apply_ms,
-            )
-        if header is not None:
-            self.nccl_broadcast_receiver.current_step = header.step
+            state_iter = self.nccl_broadcast_receiver.receive_state_dict()
+            if self.quantize_in_weight_transfer:
+                load_weights_kernel(model, state_iter)
+                update_mla_absorbed_weights(model)
+            else:
+                load_weights_checkpoint_layerwise(
+                    model,
+                    state_iter,
+                    self.model_runner.model_config,
+                    self.vllm_config,
+                )
+
+        _finish_weight_update(self.nccl_broadcast_receiver, header, self.device)
