@@ -386,6 +386,10 @@ class RLConfig(BaseConfig):
             raise ValueError(
                 "weight_broadcast.delta_mode='bf16_xor' requires trainer.model.optimization_dtype='bfloat16'."
             )
+        if self.inference.model.dtype not in ("auto", "bfloat16"):
+            raise ValueError(
+                "weight_broadcast.delta_mode='bf16_xor' requires inference.model.dtype='auto' or 'bfloat16'."
+            )
         if self.trainer.model.quantization is not None or self.inference.quantization is not None:
             raise ValueError("weight_broadcast.delta_mode='bf16_xor' does not support quantized models.")
         if self.trainer.model.dp_replicate != 1 or self.trainer.model.cp != 1:

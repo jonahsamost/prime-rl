@@ -584,6 +584,20 @@ def test_bf16_xor_weight_transfer_rejects_quantization():
         )
 
 
+@pytest.mark.parametrize("dtype", ["float16", "float32"])
+def test_bf16_xor_weight_transfer_rejects_non_bf16_inference_dtype(dtype):
+    with pytest.raises(ValidationError, match="inference.model.dtype='auto' or 'bfloat16'"):
+        RLConfig.model_validate(
+            {
+                "model": {"name": "Qwen/Qwen3-0.6B-Base"},
+                "weight_broadcast": {"type": "nccl", "delta_mode": "bf16_xor"},
+                "trainer": {"model": {"optimization_dtype": "bfloat16"}},
+                "orchestrator": {"renderer": {"name": "default"}},
+                "inference": {"model": {"dtype": dtype}, "parallel": {"tp": 1}},
+            }
+        )
+
+
 def test_shared_output_dir_propagates_through_cli(tmp_path):
     """Shared output_dir from CLI reaches sub-configs even when tyro constructs sub-configs before the before-validator."""
     toml_path = tmp_path / "cfg.toml"

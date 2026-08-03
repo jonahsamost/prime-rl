@@ -167,13 +167,18 @@ def train(config: TrainerConfig):
     logger.info(f"Initializing optimizer ({config.optim})")
 
     if config.max_concurrent_runs == 1:
+        delta_mode = (
+            config.weight_broadcast.delta_mode
+            if config.weight_broadcast.type == "nccl" and not config.data.fake
+            else "none"
+        )
         optimizer = setup_optimizer(
             config.optim,
             list(model.named_parameters()),
             parallel_dims,
             lora=config.model.lora is not None,
             cpu_offload=config.model.optim_cpu_offload,
-            delta_mode=(config.weight_broadcast.delta_mode if config.weight_broadcast.type == "nccl" else "none"),
+            delta_mode=delta_mode,
             delta_adam_bucket_mb=(
                 config.weight_broadcast.delta_adam_bucket_mb if config.weight_broadcast.type == "nccl" else 256
             ),
