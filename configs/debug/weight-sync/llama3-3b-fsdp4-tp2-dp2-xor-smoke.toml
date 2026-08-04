@@ -2,9 +2,10 @@ max_steps = 6
 seq_len = 256
 
 [model]
-name = "Qwen/Qwen3-32B"
+name = "meta-llama/Llama-3.2-3B-Instruct"
 
 [trainer.model]
+impl = "custom"
 optimization_dtype = "bfloat16"
 compile = "None"
 optim_cpu_offload = false
@@ -19,14 +20,12 @@ lr = 3e-6
 batch_size = 8
 group_size = 4
 
-# Keep uniform-reward groups so the weight-sync smoke always reaches an
-# optimizer step instead of terminating after consecutive empty batches.
 [[orchestrator.post_batch_filters]]
 type = "zero_advantage"
 enforce = false
 
 [orchestrator.renderer]
-name = "prime-qwen3"
+name = "llama-3"
 
 [orchestrator.train.sampling]
 max_completion_tokens = 64
@@ -53,7 +52,7 @@ max_model_len = 1024
 
 [inference.parallel]
 tp = 2
-dp = 1
+dp = 2
 
 [weight_broadcast]
 type = "nccl"
@@ -63,5 +62,5 @@ delta_pipeline_depth = 2
 
 [deployment]
 type = "single_node"
-num_train_gpus = 6
-num_infer_gpus = 2
+num_train_gpus = 4
+num_infer_gpus = 4
