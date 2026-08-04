@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Callable, Generator, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 from torch.distributed.tensor import DTensor

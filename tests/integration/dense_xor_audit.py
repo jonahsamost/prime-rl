@@ -22,7 +22,8 @@ _STANDARD_MODEL_TYPES = {
     "qwen3": frozenset({"qwen3"}),
     "llama3": frozenset({"llama"}),
     "gemma": frozenset({"gemma2", "gemma3", "gemma3_text"}),
-    "mistral": frozenset({"mistral"}),
+    # vLLM's Mistral-format loader exposes its runtime config as "transformer".
+    "mistral": frozenset({"mistral", "transformer"}),
 }
 
 
@@ -61,13 +62,21 @@ def audit_standard_decoder_xor(model: nn.Module, *, family: str) -> dict[str, An
     model_parameters = dict(model.named_parameters(remove_duplicate=False))
     hidden_size = int(text_config.hidden_size)
     vocab_size = int(text_config.vocab_size)
+    candidate_non_layer_shapes = {
+        "model.embed_tokens.weight": (vocab_size, hidden_size),
+        "model.norm.weight": (hidden_size,),
+    }
+    if bool(getattr(text_config, "tie_word_embeddings", False)):
+        embedding = model_parameters.get("model.embed_tokens.weight")
+        lm_head = model_parameters.get("lm_head.weight")
+        if embedding is not None and lm_head is not None and embedding is not lm_head:
+            raise AssertionError(f"{family} declares tied word embeddings but vLLM destinations are not aliases")
+    else:
+        candidate_non_layer_shapes["lm_head.weight"] = (vocab_size, hidden_size)
+
     non_layer_shapes = {
         name: shape
-        for name, shape in {
-            "model.embed_tokens.weight": (vocab_size, hidden_size),
-            "model.norm.weight": (hidden_size,),
-            "lm_head.weight": (vocab_size, hidden_size),
-        }.items()
+        for name, shape in candidate_non_layer_shapes.items()
         if name in model_parameters
     }
     if not non_layer_shapes:

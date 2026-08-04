@@ -20,15 +20,21 @@ from dense_xor_audit import (  # noqa: E402
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
 
 _MODEL_AUDITS = (
-    ("qwen3", "Qwen/Qwen3-0.6B-Base", audit_qwen3_xor),
-    ("llama3", "meta-llama/Llama-3.2-1B-Instruct", audit_llama3_xor),
-    ("gemma", "google/gemma-3-1b-it", audit_gemma_xor),
-    ("mistral", "mistralai/Mistral-7B-v0.3", audit_mistral_xor),
+    ("qwen3_0_6b", "qwen3", "Qwen/Qwen3-0.6B-Base", audit_qwen3_xor),
+    ("qwen3_8b", "qwen3", "Qwen/Qwen3-8B-Base", audit_qwen3_xor),
+    ("llama3", "llama3", "meta-llama/Llama-3.2-1B-Instruct", audit_llama3_xor),
+    ("gemma", "gemma", "google/gemma-3-1b-it", audit_gemma_xor),
+    ("mistral", "mistral", "mistralai/Mistral-7B-v0.3", audit_mistral_xor),
 )
 
 
-@pytest.mark.parametrize(("family", "default_model", "audit"), _MODEL_AUDITS, ids=[item[0] for item in _MODEL_AUDITS])
+@pytest.mark.parametrize(
+    ("case", "family", "default_model", "audit"),
+    _MODEL_AUDITS,
+    ids=[item[0] for item in _MODEL_AUDITS],
+)
 def test_dense_model_source_xor_routes_and_applies_byte_exactly(
+    case: str,
     family: str,
     default_model: str,
     audit,
@@ -45,7 +51,10 @@ def test_dense_model_source_xor_routes_and_applies_byte_exactly(
 
     from vllm import LLM
 
-    model = os.environ.get(f"DENSE_XOR_{family.upper()}_MODEL", default_model)
+    model = os.environ.get(
+        f"DENSE_XOR_{case.upper()}_MODEL",
+        os.environ.get(f"DENSE_XOR_{family.upper()}_MODEL", default_model),
+    )
     tensor_parallel_size = int(os.environ.get("DENSE_XOR_TP_SIZE", "1"))
     llm = LLM(
         model=model,
