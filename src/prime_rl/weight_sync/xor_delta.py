@@ -13,11 +13,29 @@ from torch.distributed.tensor import DTensor
 NCCL_DELTA_PROTOCOL_MAGIC = 0x50524C44  # "PRLD"
 NVCOMP_FRAME_ALIGNMENT = 256
 DEFAULT_NVCOMP_PIPELINE_DEPTH = 2
+SUPPORTED_DELTA_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+
+_DTYPE_NAMES = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+}
+_DTYPES_BY_NAME = {name: dtype for dtype, name in _DTYPE_NAMES.items()}
+_INTEGER_DTYPES = {
+    torch.bfloat16: torch.int16,
+    torch.float16: torch.int16,
+    torch.float32: torch.int32,
+}
+_DTYPE_NBYTES = {
+    torch.bfloat16: 2,
+    torch.float16: 2,
+    torch.float32: 4,
+}
 
 
 class WeightUpdateKind(IntEnum):
     FULL = 0
-    BF16_XOR = 1
+    XOR = 1
 
 
 @dataclass(frozen=True)
@@ -29,10 +47,8 @@ class WeightUpdateHeader:
 
 
 def encode_weight_update_header(header: WeightUpdateHeader, *, device: torch.device | str | int) -> Tensor:
-    if header.kind == WeightUpdateKind.BF16_XOR and header.step != header.base_step + 1:
-        raise ValueError(
-            f"BF16 XOR header must name consecutive versions: base_step={header.base_step}, step={header.step}"
-        )
+    if header.kind == WeightUpdateKind.XOR and header.step != header.base_step + 1:
+        raise ValueError(f"XOR header must name consecutive versions: base_step={header.base_step}, step={header.step}")
     if header.kind == WeightUpdateKind.FULL and header.base_step != -1:
         raise ValueError(f"full update header must use base_step=-1, got {header.base_step}")
     if header.optimizer_start_ns < 0:
@@ -69,6 +85,7 @@ def decode_weight_update_header(values: Tensor) -> WeightUpdateHeader:
 class DeltaTensorMetadata:
     name: str
     shape: tuple[int, ...]
+    dtype: str
     nbytes: int
     global_shape: tuple[int, ...] | None = None
     shard_dim: int | None = None
@@ -107,7 +124,7 @@ class PendingDeltaFrame:
 
 
 @dataclass(frozen=True)
-class BF16DeltaUpdate:
+class DeltaUpdate:
     """A GPU-resident nvCOMP LZ4 source-layout XOR update."""
 
     base_step: int
@@ -137,12 +154,12 @@ class BF16DeltaUpdate:
 
 
 @dataclass(frozen=True)
-class ShardedBF16DeltaUpdate:
+class ShardedDeltaUpdate:
     """Rank-local compressed FSDP shards for one logical policy update."""
 
     base_step: int
     step: int
-    shards: tuple[BF16DeltaUpdate, ...]
+    shards: tuple[DeltaUpdate, ...]
 
     @property
     def uncompressed_nbytes(self) -> int:
@@ -167,12 +184,43 @@ def local_tensor(tensor: Tensor) -> Tensor:
     return tensor
 
 
+def delta_dtype_name(dtype: torch.dtype) -> str:
+    try:
+        return _DTYPE_NAMES[dtype]
+    except KeyError as error:
+        raise TypeError(f"unsupported XOR delta dtype {dtype}; expected one of {SUPPORTED_DELTA_DTYPES}") from error
+
+
+def delta_dtype_from_name(name: str) -> torch.dtype:
+    try:
+        return _DTYPES_BY_NAME[name]
+    except KeyError as error:
+        raise ValueError(f"unsupported XOR delta dtype name {name!r}") from error
+
+
+def integer_view(tensor: Tensor) -> Tensor:
+    try:
+        dtype = _INTEGER_DTYPES[tensor.dtype]
+    except KeyError as error:
+        raise TypeError(
+            f"unsupported XOR delta dtype {tensor.dtype}; expected one of {SUPPORTED_DELTA_DTYPES}"
+        ) from error
+    return tensor.view(dtype)
+
+
+def delta_dtype_nbytes(dtype: torch.dtype) -> int:
+    try:
+        return _DTYPE_NBYTES[dtype]
+    except KeyError as error:
+        raise TypeError(f"unsupported XOR delta dtype {dtype}; expected one of {SUPPORTED_DELTA_DTYPES}") from error
+
+
 def _load_nvcomp():
     try:
         from nvidia import nvcomp
     except ImportError as error:
         raise RuntimeError(
-            "BF16 XOR weight synchronization requires nvidia-nvcomp-cu12 on a CUDA-capable Linux host"
+            "XOR weight synchronization requires nvidia-nvcomp-cu12 on a CUDA-capable Linux host"
         ) from error
     return nvcomp
 
@@ -330,8 +378,8 @@ class NvcompLZ4Codec:
         return value.view(torch.uint8).reshape(-1)
 
 
-class BF16DeltaEncoder:
-    """Compress contiguous BF16 XOR parameter buckets through nvCOMP LZ4 on GPU."""
+class DeltaEncoder:
+    """Compress contiguous floating-point XOR parameter buckets through nvCOMP LZ4 on GPU."""
 
     def __init__(
         self,
@@ -342,7 +390,7 @@ class BF16DeltaEncoder:
         pipeline_depth: int = DEFAULT_NVCOMP_PIPELINE_DEPTH,
     ) -> None:
         if step != base_step + 1:
-            raise ValueError(f"BF16 delta updates must be consecutive: base_step={base_step}, step={step}")
+            raise ValueError(f"XOR delta updates must be consecutive: base_step={base_step}, step={step}")
         self.base_step = base_step
         self.step = step
         self.codec = codec
@@ -360,16 +408,15 @@ class BF16DeltaEncoder:
 
     def append_batch(self, values: Sequence[tuple[str, Tensor]]) -> None:
         if self._finished:
-            raise RuntimeError("cannot append to a finished BF16 delta encoder")
+            raise RuntimeError("cannot append to a finished XOR delta encoder")
         normalized = self._normalize_values(values)
         if not normalized:
             return
         device = normalized[0][1].device
-        bucket = torch.empty(
-            sum(value.numel() for _, value in normalized),
-            dtype=torch.bfloat16,
-            device=device,
-        )
+        dtype = normalized[0][1].dtype
+        if any(value.dtype != dtype for _, value in normalized):
+            raise TypeError("an XOR delta batch must contain a single dtype")
+        bucket = torch.empty(sum(value.numel() for _, value in normalized), dtype=dtype, device=device)
         bucket_values: list[tuple[str, Tensor]] = []
         offset = 0
         for name, value in normalized:
@@ -394,42 +441,45 @@ class BF16DeltaEncoder:
         shard_count: int = 1,
     ) -> None:
         if self._finished:
-            raise RuntimeError("cannot append to a finished BF16 delta encoder")
+            raise RuntimeError("cannot append to a finished XOR delta encoder")
         normalized = self._normalize_values(values)
         if not normalized:
             return
         bucket = local_tensor(bucket.detach())
-        if bucket.dtype != torch.bfloat16 or bucket.device.type != "cuda" or not bucket.is_contiguous():
+        if bucket.dtype not in SUPPORTED_DELTA_DTYPES or bucket.device.type != "cuda" or not bucket.is_contiguous():
             raise ValueError(
-                "BF16 delta bucket must be a contiguous CUDA BF16 tensor; "
+                "XOR delta bucket must be a contiguous CUDA tensor with a supported dtype; "
                 f"got dtype={bucket.dtype}, device={bucket.device}, stride={bucket.stride()}"
             )
         expected_elements = sum(value.numel() for _, value in normalized)
         if bucket.numel() != expected_elements:
-            raise ValueError(f"BF16 delta bucket has {bucket.numel()} elements; tensors require {expected_elements}")
+            raise ValueError(f"XOR delta bucket has {bucket.numel()} elements; tensors require {expected_elements}")
         offset = 0
         for name, value in normalized:
             if value.device != bucket.device:
                 raise ValueError(f"{name} is on {value.device}; bucket is on {bucket.device}")
+            if value.dtype != bucket.dtype:
+                raise TypeError(f"{name} has dtype {value.dtype}; bucket has dtype {bucket.dtype}")
             expected_pointer = bucket.data_ptr() + offset * bucket.element_size()
             if value.data_ptr() != expected_pointer:
-                raise ValueError(f"{name} is not the expected contiguous view into its BF16 delta bucket")
+                raise ValueError(f"{name} is not the expected contiguous view into its XOR delta bucket")
             offset += value.numel()
 
         if global_shapes is None:
             global_shapes = [tuple(value.shape) for _, value in normalized]
         if len(global_shapes) != len(normalized):
-            raise ValueError(f"received {len(global_shapes)} global shapes for {len(normalized)} BF16 delta tensors")
+            raise ValueError(f"received {len(global_shapes)} global shapes for {len(normalized)} XOR delta tensors")
         if shard_descriptors is None:
             shard_descriptors = [(shard_dim, shard_index, shard_count)] * len(normalized)
         if len(shard_descriptors) != len(normalized):
             raise ValueError(
-                f"received {len(shard_descriptors)} shard descriptors for {len(normalized)} BF16 delta tensors"
+                f"received {len(shard_descriptors)} shard descriptors for {len(normalized)} XOR delta tensors"
             )
         metadata = tuple(
             DeltaTensorMetadata(
                 name=name,
                 shape=tuple(value.shape),
+                dtype=delta_dtype_name(value.dtype),
                 nbytes=value.numel() * value.element_size(),
                 global_shape=tuple(global_shape),
                 shard_dim=descriptor[0],
@@ -456,15 +506,15 @@ class BF16DeltaEncoder:
         if len(self._pending) >= self.pipeline_depth:
             self._finalize_oldest()
 
-    def finish(self) -> BF16DeltaUpdate:
+    def finish(self) -> DeltaUpdate:
         if self._finished:
-            raise RuntimeError("BF16 delta encoder is already finished")
+            raise RuntimeError("XOR delta encoder is already finished")
         self._finished = True
         while self._pending:
             self._finalize_oldest()
         packed = self.codec.pack(self._payloads)
         self.codec.synchronize()
-        update = BF16DeltaUpdate(
+        update = DeltaUpdate(
             base_step=self.base_step,
             step=self.step,
             tensors=tuple(self._tensors),
@@ -483,7 +533,7 @@ class BF16DeltaEncoder:
         pending = self._pending.popleft()
         payloads = self.codec.finalize_encode(pending.encode)
         if len(payloads) != 1:
-            raise RuntimeError(f"nvCOMP returned {len(payloads)} frames for one BF16 delta bucket")
+            raise RuntimeError(f"nvCOMP returned {len(payloads)} frames for one XOR delta bucket")
         payload = payloads[0]
         self._frames.append(
             CompressedDeltaFrame(
@@ -500,14 +550,14 @@ class BF16DeltaEncoder:
         normalized: list[tuple[str, Tensor]] = []
         for name, delta in values:
             value = local_tensor(delta.detach())
-            if value.dtype != torch.bfloat16:
-                raise TypeError(f"{name} has dtype {value.dtype}; BF16 delta mode requires BF16 parameters")
+            if value.dtype not in SUPPORTED_DELTA_DTYPES:
+                raise TypeError(f"{name} has dtype {value.dtype}; XOR delta mode supports {SUPPORTED_DELTA_DTYPES}")
             if value.device.type != "cuda":
-                raise ValueError(f"{name} is on {value.device}; BF16 delta mode requires CUDA tensors")
+                raise ValueError(f"{name} is on {value.device}; XOR delta mode requires CUDA tensors")
             if not value.is_contiguous():
                 raise ValueError(f"{name} is non-contiguous with stride {value.stride()}")
             if value.numel() == 0:
-                raise ValueError(f"{name} is empty; BF16 delta tensors must contain at least one element")
+                raise ValueError(f"{name} is empty; XOR delta tensors must contain at least one element")
             normalized.append((name, value))
         return normalized
 
@@ -530,34 +580,36 @@ def decode_delta_tensors(
         frame_tensors = tensors[frame.first_tensor_index : frame.first_tensor_index + frame.tensor_count]
         for metadata in frame_tensors:
             tensor_bytes = raw.narrow(0, offset, metadata.nbytes)
-            values.append((metadata.name, tensor_bytes.view(torch.bfloat16).view(metadata.shape)))
+            dtype = delta_dtype_from_name(metadata.dtype)
+            values.append((metadata.name, tensor_bytes.view(dtype).view(metadata.shape)))
             offset += metadata.nbytes
         if offset != frame.uncompressed_nbytes:
             raise ValueError(
-                f"decoded BF16 delta frame describes {offset} tensor bytes; expected {frame.uncompressed_nbytes}"
+                f"decoded XOR delta frame describes {offset} tensor bytes; expected {frame.uncompressed_nbytes}"
             )
     return values
 
 
-def validate_delta_update(update: BF16DeltaUpdate) -> None:
+def validate_delta_update(update: DeltaUpdate) -> None:
     valid_payload = (
         update.payload.dtype == torch.uint8 and update.payload.device.type == "cuda" and update.payload.is_contiguous()
     )
     if not valid_payload:
         raise ValueError(
-            "BF16 delta payload must be a contiguous CUDA uint8 tensor; "
+            "XOR delta payload must be a contiguous CUDA uint8 tensor; "
             f"got dtype={update.payload.dtype}, device={update.payload.device}, stride={update.payload.stride()}"
         )
     if update.payload.data_ptr() % NVCOMP_FRAME_ALIGNMENT != 0:
         raise ValueError(
-            f"BF16 delta payload address {update.payload.data_ptr():#x} is not {NVCOMP_FRAME_ALIGNMENT}-byte aligned"
+            f"XOR delta payload address {update.payload.data_ptr():#x} is not {NVCOMP_FRAME_ALIGNMENT}-byte aligned"
         )
     names: set[str] = set()
     for tensor in update.tensors:
         if not tensor.name or tensor.name in names:
-            raise ValueError(f"invalid or duplicate BF16 delta tensor name: {tensor.name!r}")
+            raise ValueError(f"invalid or duplicate XOR delta tensor name: {tensor.name!r}")
         names.add(tensor.name)
-        expected = prod(tensor.shape) * 2
+        dtype = delta_dtype_from_name(tensor.dtype)
+        expected = prod(tensor.shape) * delta_dtype_nbytes(dtype)
         if tensor.nbytes != expected:
             raise ValueError(f"{tensor.name} metadata has {tensor.nbytes} bytes; shape requires {expected}")
         global_shape = tensor.resolved_global_shape
@@ -576,23 +628,26 @@ def validate_delta_update(update: BF16DeltaUpdate) -> None:
     for frame_index, frame in enumerate(update.frames):
         if frame.first_tensor_index != next_tensor_index:
             raise ValueError(
-                f"BF16 delta frame {frame_index} starts at tensor {frame.first_tensor_index}; "
+                f"XOR delta frame {frame_index} starts at tensor {frame.first_tensor_index}; "
                 f"expected {next_tensor_index}"
             )
         if frame.tensor_count <= 0 or frame.first_tensor_index + frame.tensor_count > len(update.tensors):
-            raise ValueError(f"BF16 delta frame {frame_index} has invalid tensor count {frame.tensor_count}")
+            raise ValueError(f"XOR delta frame {frame_index} has invalid tensor count {frame.tensor_count}")
         frame_tensors = update.tensors[frame.first_tensor_index : frame.first_tensor_index + frame.tensor_count]
+        frame_dtypes = {tensor.dtype for tensor in frame_tensors}
+        if len(frame_dtypes) != 1:
+            raise ValueError(f"XOR delta frame {frame_index} mixes tensor dtypes: {sorted(frame_dtypes)}")
         expected_uncompressed = sum(tensor.nbytes for tensor in frame_tensors)
         if frame.uncompressed_nbytes != expected_uncompressed:
             raise ValueError(
-                f"BF16 delta frame {frame_index} has {frame.uncompressed_nbytes} raw bytes; "
+                f"XOR delta frame {frame_index} has {frame.uncompressed_nbytes} raw bytes; "
                 f"its tensors require {expected_uncompressed}"
             )
         if frame.compressed_nbytes <= 0:
-            raise ValueError(f"BF16 delta frame {frame_index} has invalid compressed size {frame.compressed_nbytes}")
+            raise ValueError(f"XOR delta frame {frame_index} has invalid compressed size {frame.compressed_nbytes}")
         next_tensor_index += frame.tensor_count
     if next_tensor_index != len(update.tensors):
-        raise ValueError(f"BF16 delta frames cover {next_tensor_index} of {len(update.tensors)} tensors")
+        raise ValueError(f"XOR delta frames cover {next_tensor_index} of {len(update.tensors)} tensors")
     packed_bytes = packed_delta_nbytes(update.frames)
     if packed_bytes != update.compressed_nbytes:
         raise ValueError(
@@ -601,9 +656,9 @@ def validate_delta_update(update: BF16DeltaUpdate) -> None:
         )
 
 
-def validate_sharded_delta_update(update: ShardedBF16DeltaUpdate) -> None:
+def validate_sharded_delta_update(update: ShardedDeltaUpdate) -> None:
     if not update.shards:
-        raise ValueError("distributed BF16 delta update has no trainer shards")
+        raise ValueError("distributed XOR delta update has no trainer shards")
     shard_count = len(update.shards)
     reference = update.shards[0]
     for rank, shard in enumerate(update.shards):
@@ -616,7 +671,11 @@ def validate_sharded_delta_update(update: ShardedBF16DeltaUpdate) -> None:
         if len(shard.tensors) != len(reference.tensors) or len(shard.frames) != len(reference.frames):
             raise ValueError(f"trainer shard {rank} has an incompatible tensor/frame manifest")
         for tensor_index, (candidate, expected) in enumerate(zip(shard.tensors, reference.tensors, strict=True)):
-            if candidate.name != expected.name or candidate.resolved_global_shape != expected.resolved_global_shape:
+            if (
+                candidate.name != expected.name
+                or candidate.dtype != expected.dtype
+                or candidate.resolved_global_shape != expected.resolved_global_shape
+            ):
                 raise ValueError(f"trainer shard {rank} tensor {tensor_index} does not match the rank-0 manifest")
             if expected.shard_count == 1:
                 if (
@@ -660,22 +719,27 @@ def reconstruct_delta_tensors(
 ) -> list[tuple[str, Tensor]]:
     """Reconstruct full source-layout tensors from rank-ordered dimension-0 shards."""
     if not shard_values or len(shard_values) != len(shard_metadata):
-        raise ValueError("BF16 delta reconstruction requires matching non-empty values and metadata")
+        raise ValueError("XOR delta reconstruction requires matching non-empty values and metadata")
     tensor_count = len(shard_values[0])
     if any(len(values) != tensor_count for values in shard_values) or any(
         len(metadata) != tensor_count for metadata in shard_metadata
     ):
-        raise ValueError("BF16 delta shard frames contain different tensor counts")
+        raise ValueError("XOR delta shard frames contain different tensor counts")
     reconstructed: list[tuple[str, Tensor]] = []
     for tensor_index in range(tensor_count):
         pieces = [values[tensor_index][1] for values in shard_values]
         metadata = [items[tensor_index] for items in shard_metadata]
         names = [values[tensor_index][0] for values in shard_values]
         if any(name != names[0] for name in names) or any(item.name != names[0] for item in metadata):
-            raise ValueError(f"BF16 delta shard tensor {tensor_index} has inconsistent names")
+            raise ValueError(f"XOR delta shard tensor {tensor_index} has inconsistent names")
         global_shape = metadata[0].resolved_global_shape
         if any(item.resolved_global_shape != global_shape for item in metadata):
             raise ValueError(f"{names[0]} has inconsistent global shapes")
+        dtype = metadata[0].dtype
+        if any(item.dtype != dtype for item in metadata) or any(
+            piece.dtype != delta_dtype_from_name(dtype) for piece in pieces
+        ):
+            raise ValueError(f"{names[0]} has inconsistent XOR delta dtypes")
         if metadata[0].shard_count == 1:
             if any(
                 item.shard_count != 1
@@ -728,17 +792,22 @@ def _packed_nbytes(payloads: Sequence[Tensor]) -> int:
 
 
 __all__ = [
-    "BF16DeltaEncoder",
-    "BF16DeltaUpdate",
-    "ShardedBF16DeltaUpdate",
     "CompressedDeltaFrame",
+    "DeltaEncoder",
     "DeltaTensorMetadata",
+    "DeltaUpdate",
     "NvcompLZ4Codec",
+    "SUPPORTED_DELTA_DTYPES",
+    "ShardedDeltaUpdate",
     "WeightUpdateHeader",
     "WeightUpdateKind",
+    "delta_dtype_from_name",
+    "delta_dtype_name",
+    "delta_dtype_nbytes",
     "decode_delta_tensors",
     "decode_weight_update_header",
     "encode_weight_update_header",
+    "integer_view",
     "local_tensor",
     "packed_delta_nbytes",
     "reconstruct_delta_tensors",

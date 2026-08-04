@@ -96,10 +96,10 @@ enable_token_export = true
 
 Leave it unset for normal training. When enabled, it exports every sequence from each exporting rank.
 
-## Experimental BF16 XOR weight transfer
+## Experimental XOR weight transfer
 
-The NCCL broadcaster has an opt-in GPU-resident nvCOMP LZ4 path for BF16 XOR
-updates:
+The NCCL broadcaster has an opt-in GPU-resident nvCOMP LZ4 path for exact
+bitwise XOR updates in BF16, FP16, or FP32:
 
 ```toml
 [model]
@@ -108,9 +108,12 @@ name = "Qwen/Qwen3-0.6B-Base"
 [trainer.model]
 optimization_dtype = "bfloat16"
 
+[inference.model]
+dtype = "bfloat16"
+
 [weight_broadcast]
 type = "nccl"
-delta_mode = "bf16_xor"
+delta_mode = "xor"
 delta_adam_bucket_mb = 256
 delta_pipeline_depth = 2
 ```
@@ -118,17 +121,21 @@ delta_pipeline_depth = 2
 Use `configs/debug/weight-sync/qwen3-32b-fsdp6-tp2-delta-smoke.toml` for the
 end-to-end Qwen3-32B smoke run.
 
-This mode currently requires dense Qwen3, AdamW, BF16, single-run training,
-`dp_replicate=1`, `cp=1`, `ep=1`, a single-node deployment, and no trainer,
-inference, or transfer quantization. Configuration validation rejects other
-combinations. The startup update is a normal full checkpoint transfer;
+This mode currently requires a text-only dense model with conventional
+Hugging Face layer names, AdamW, single-run training, `dp_replicate=1`, `cp=1`,
+`ep=1`, a single-node deployment, and no trainer, inference, or transfer
+quantization. Trainer `optimization_dtype` and inference `model.dtype` must be
+the same explicit value: `bfloat16`, `float16`, or `float32`. Model loaders must
+route weights through same-dtype, bit-preserving operations. Fake-data runs
+skip weight transfer and use standard AdamW even when delta mode is configured.
+The startup update is a normal full checkpoint transfer;
 later consecutive versions are source-layout XOR updates. AdamW snapshots and
 updates bounded local parameter buckets, invokes one foreach-capable AdamW update per
 bucket, and batch-compresses that bucket's parameter XOR tensors with nvCOMP LZ4
 without leaving CUDA memory. The compressed tensor streams are packed into one
 CUDA `uint8` payload per trainer rank. Rank zero gathers compressed payloads and
 broadcasts them directly with NCCL. Each inference TP rank reconstructs and
-applies one Qwen layer at a time. Runtime logs report the raw/compressed byte
+applies one source layer at a time. Runtime logs report the raw/compressed byte
 ratio and optimizer-start-to-inference-apply latency.
 
 ## Key files

@@ -138,8 +138,8 @@ class SharedNCCLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
     quantize_in_weight_transfer: bool = False
     """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
 
-    delta_mode: Literal["none", "bf16_xor"] = "none"
-    """Experimental GPU nvCOMP LZ4 BF16 XOR updates over NCCL."""
+    delta_mode: Literal["none", "xor"] = "none"
+    """Experimental GPU nvCOMP LZ4 XOR updates over NCCL."""
 
     delta_adam_bucket_mb: int = Field(256, ge=1)
     """Maximum local parameter MiB updated by each batched AdamW call.
@@ -362,44 +362,36 @@ class RLConfig(BaseConfig):
         return self
 
     @model_validator(mode="after")
-    def validate_bf16_xor_weight_transfer(self):
+    def validate_xor_weight_transfer(self):
         if not isinstance(self.weight_broadcast, SharedNCCLWeightBroadcastConfig):
             return self
         if self.weight_broadcast.delta_mode == "none":
             return self
         if self.weight_broadcast.quantize_in_weight_transfer:
-            raise ValueError("weight_broadcast.delta_mode='bf16_xor' is incompatible with quantized transfer.")
+            raise ValueError("weight_broadcast.delta_mode='xor' is incompatible with quantized transfer.")
         if self.inference is None:
-            raise ValueError("weight_broadcast.delta_mode='bf16_xor' requires an inference config.")
-        if (
-            self.model is None
-            or "Qwen3" not in self.model.name
-            or "A3B" in self.model.name
-            or "A22B" in self.model.name
-        ):
-            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently supports dense Qwen3 models only.")
+            raise ValueError("weight_broadcast.delta_mode='xor' requires an inference config.")
+        if self.model is None or self.model.vlm is not None:
+            raise ValueError("weight_broadcast.delta_mode='xor' currently supports text-only dense models.")
         if self.trainer.optim.type != "adamw":
-            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently requires trainer.optim.type='adamw'.")
+            raise ValueError("weight_broadcast.delta_mode='xor' currently requires trainer.optim.type='adamw'.")
         if self.trainer.max_concurrent_runs != 1:
-            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently requires max_concurrent_runs=1.")
-        if self.trainer.model.optimization_dtype != "bfloat16":
+            raise ValueError("weight_broadcast.delta_mode='xor' currently requires max_concurrent_runs=1.")
+        if self.inference.model.dtype != self.trainer.model.optimization_dtype:
             raise ValueError(
-                "weight_broadcast.delta_mode='bf16_xor' requires trainer.model.optimization_dtype='bfloat16'."
-            )
-        if self.inference.model.dtype not in ("auto", "bfloat16"):
-            raise ValueError(
-                "weight_broadcast.delta_mode='bf16_xor' requires inference.model.dtype='auto' or 'bfloat16'."
+                "weight_broadcast.delta_mode='xor' requires inference.model.dtype to exactly match "
+                "trainer.model.optimization_dtype."
             )
         if self.trainer.model.quantization is not None or self.inference.quantization is not None:
-            raise ValueError("weight_broadcast.delta_mode='bf16_xor' does not support quantized models.")
+            raise ValueError("weight_broadcast.delta_mode='xor' does not support quantized models.")
         if self.trainer.model.dp_replicate != 1 or self.trainer.model.cp != 1:
             raise ValueError(
-                "weight_broadcast.delta_mode='bf16_xor' currently requires trainer.model.dp_replicate=1 and cp=1."
+                "weight_broadcast.delta_mode='xor' currently requires trainer.model.dp_replicate=1 and cp=1."
             )
         if self.trainer.model.ep not in ("auto", 1):
-            raise ValueError("weight_broadcast.delta_mode='bf16_xor' does not yet support expert parallelism.")
+            raise ValueError("weight_broadcast.delta_mode='xor' does not yet support expert parallelism.")
         if self.deployment.type != "single_node":
-            raise ValueError("weight_broadcast.delta_mode='bf16_xor' currently requires a single-node deployment.")
+            raise ValueError("weight_broadcast.delta_mode='xor' currently requires a single-node deployment.")
         return self
 
     ### Auto-setup shared configs (before sub-config construction)

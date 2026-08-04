@@ -427,8 +427,8 @@ class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     quantize_in_weight_transfer: bool = False
     """Use kernel-format FP8 quantized NCCL transfer for weight updates."""
 
-    delta_mode: Literal["none", "bf16_xor"] = "none"
-    """Experimental GPU nvCOMP LZ4 BF16 XOR update protocol."""
+    delta_mode: Literal["none", "xor"] = "none"
+    """Experimental GPU nvCOMP LZ4 XOR update protocol."""
 
     delta_adam_bucket_mb: int = Field(256, ge=1)
     """Maximum local parameter MiB updated by each batched AdamW call.

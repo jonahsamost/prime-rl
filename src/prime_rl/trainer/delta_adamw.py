@@ -10,10 +10,12 @@ from torch.optim import AdamW
 from torch.optim.adam import adam
 from torch.optim.optimizer import _use_grad_for_differentiable
 
-from prime_rl.weight_sync.bf16_delta import (
-    BF16DeltaEncoder,
-    BF16DeltaUpdate,
+from prime_rl.weight_sync.xor_delta import (
+    SUPPORTED_DELTA_DTYPES,
+    DeltaEncoder,
+    DeltaUpdate,
     NvcompLZ4Codec,
+    integer_view,
     local_tensor,
 )
 
@@ -26,7 +28,7 @@ def _canonical_parameter_name(name: str) -> str:
 
 
 class DeltaAdamW(AdamW):
-    """AdamW that records each parameter's exact BF16 XOR immediately after updating it."""
+    """AdamW that records each parameter's exact bitwise XOR immediately after updating it."""
 
     def __init__(
         self,
@@ -46,8 +48,8 @@ class DeltaAdamW(AdamW):
             raise ValueError("parameter names are not unique after removing checkpoint-wrapper prefixes")
         super().__init__([parameter for _, parameter in named_params], **kwargs)
         self._parameter_names = {id(parameter): name for name, parameter in named_params}
-        self._encoder: BF16DeltaEncoder | None = None
-        self._pending_update: BF16DeltaUpdate | None = None
+        self._encoder: DeltaEncoder | None = None
+        self._pending_update: DeltaUpdate | None = None
         self._delta_adam_bucket_bytes = delta_adam_bucket_bytes
         self._delta_pipeline_depth = delta_pipeline_depth
         device = local_tensor(named_params[0][1]).device
@@ -55,17 +57,17 @@ class DeltaAdamW(AdamW):
 
     def begin_delta(self, *, base_step: int, step: int) -> None:
         if self._encoder is not None:
-            raise RuntimeError("a BF16 delta recording is already active")
+            raise RuntimeError("an XOR delta recording is already active")
         if self._pending_update is not None:
-            raise RuntimeError("the previous BF16 delta update has not been consumed")
-        self._encoder = BF16DeltaEncoder(
+            raise RuntimeError("the previous XOR delta update has not been consumed")
+        self._encoder = DeltaEncoder(
             base_step=base_step,
             step=step,
             codec=self._delta_codec,
             pipeline_depth=self._delta_pipeline_depth,
         )
 
-    def take_delta_update(self) -> BF16DeltaUpdate | None:
+    def take_delta_update(self) -> DeltaUpdate | None:
         update = self._pending_update
         self._pending_update = None
         return update
@@ -90,7 +92,7 @@ class DeltaAdamW(AdamW):
             with torch.enable_grad():
                 loss = closure()
 
-        update: BF16DeltaUpdate | None = None
+        update: DeltaUpdate | None = None
         try:
             for group in self.param_groups:
                 params_with_grad: list[Tensor] = []
@@ -111,7 +113,7 @@ class DeltaAdamW(AdamW):
                     state_steps,
                 )
                 if has_complex:
-                    raise TypeError("BF16 delta mode does not support complex parameters")
+                    raise TypeError("XOR delta mode does not support complex parameters")
 
                 for bucket_start, bucket_end, _bucket_bytes in _parameter_buckets(
                     params_with_grad,
@@ -122,9 +124,10 @@ class DeltaAdamW(AdamW):
                     for parameter in bucket_parameters:
                         local_parameter = local_tensor(parameter)
                         name = self._parameter_names[id(parameter)]
-                        if local_parameter.dtype != torch.bfloat16:
+                        if local_parameter.dtype not in SUPPORTED_DELTA_DTYPES:
                             raise TypeError(
-                                f"{name} has dtype {local_parameter.dtype}; BF16 delta mode requires BF16 parameters"
+                                f"{name} has dtype {local_parameter.dtype}; "
+                                f"XOR delta mode supports {SUPPORTED_DELTA_DTYPES}"
                             )
                         if not local_parameter.is_contiguous():
                             raise ValueError(f"{name} is non-contiguous with stride {local_parameter.stride()}")
@@ -132,7 +135,7 @@ class DeltaAdamW(AdamW):
 
                     old_bucket = torch.empty(
                         sum(parameter.numel() for parameter in local_parameters),
-                        dtype=torch.bfloat16,
+                        dtype=local_parameters[0].dtype,
                         device=local_parameters[0].device,
                     )
                     old_values: list[Tensor] = []
@@ -169,7 +172,7 @@ class DeltaAdamW(AdamW):
                         decoupled_weight_decay=group["decoupled_weight_decay"],
                     )
                     for current_value, old_value in zip(local_parameters, old_values, strict=True):
-                        old_value.view(torch.int16).bitwise_xor_(current_value.view(torch.int16))
+                        integer_view(old_value).bitwise_xor_(integer_view(current_value))
                     shard_descriptors = [_parameter_shard_descriptor(parameter) for parameter in bucket_parameters]
                     self._encoder.append_sharded_bucket(
                         [
@@ -189,7 +192,7 @@ class DeltaAdamW(AdamW):
             raise
 
         if update is not None:
-            # A compressed payload that is no smaller than BF16 falls back to the
+            # A compressed payload that is no smaller than the source weights falls back to the
             # existing full-weight path for this version.
             self._pending_update = update if update.compressed_nbytes < update.uncompressed_nbytes else None
         return loss
@@ -202,13 +205,15 @@ def _parameter_buckets(
     """Yield contiguous parameter ranges capped by local parameter bytes."""
     start = 0
     used = 0
+    dtype: torch.dtype | None = None
     for index, parameter in enumerate(parameters):
         value = local_tensor(parameter)
         parameter_bytes = value.numel() * value.element_size()
-        if used and used + parameter_bytes > bucket_bytes:
+        if used and (value.dtype != dtype or used + parameter_bytes > bucket_bytes):
             yield start, index, used
             start = index
             used = 0
+        dtype = value.dtype
         used += parameter_bytes
     if start < len(parameters):
         yield start, len(parameters), used
@@ -222,19 +227,17 @@ def _parameter_shard_descriptor(parameter: Tensor) -> tuple[tuple[int, ...], int
     if not shard_mesh_dims:
         return tuple(parameter.shape), None, 0, 1
     if len(shard_mesh_dims) != 1:
-        raise ValueError(
-            f"BF16 delta FSDP mode requires exactly one sharded mesh dimension, got {parameter.placements}"
-        )
+        raise ValueError(f"XOR delta FSDP mode requires exactly one sharded mesh dimension, got {parameter.placements}")
     if any(
         isinstance(placement, Replicate) and parameter.device_mesh.size(index) > 1
         for index, placement in enumerate(parameter.placements)
     ):
-        raise ValueError("BF16 delta FSDP mode does not yet support replicated HSDP mesh dimensions")
+        raise ValueError("XOR delta FSDP mode does not yet support replicated HSDP mesh dimensions")
     shard_mesh_dim = shard_mesh_dims[0]
     placement = parameter.placements[shard_mesh_dim]
     assert isinstance(placement, Shard)
     if placement.dim != 0:
-        raise ValueError(f"BF16 delta FSDP mode supports Shard(0), got {placement}")
+        raise ValueError(f"XOR delta FSDP mode supports Shard(0), got {placement}")
     shard_count = parameter.device_mesh.size(shard_mesh_dim)
     if shard_count == 1:
         return tuple(parameter.shape), None, 0, 1

@@ -58,7 +58,7 @@ from prime_rl.trainer.utils import (
     setup_torch_distributed,
     print_benchmark,
 )
-from prime_rl.weight_sync.bf16_delta import BF16DeltaUpdate
+from prime_rl.weight_sync.xor_delta import DeltaUpdate, delta_dtype_from_name
 from prime_rl.trainer.world import get_world
 from prime_rl.trainer.runs import setup_multi_run_manager, Progress, get_multi_run_manager
 from prime_rl.trainer.models.layers.lora import set_lora_num_tokens
@@ -210,12 +210,17 @@ def train(config: TrainerConfig):
             config.weight_broadcast,
             parallel_dims,
             config.model.lora,
+            dtype=(
+                delta_dtype_from_name(config.model.optimization_dtype)
+                if config.weight_broadcast.type == "nccl" and config.weight_broadcast.delta_mode == "xor"
+                else torch.bfloat16
+            ),
         )
     delta_optimizer = (
         optimizer
         if weight_broadcast is not None
         and config.weight_broadcast.type == "nccl"
-        and config.weight_broadcast.delta_mode == "bf16_xor"
+        and config.weight_broadcast.delta_mode == "xor"
         else None
     )
 
@@ -601,7 +606,7 @@ def train(config: TrainerConfig):
 
         # The delta-aware AdamW bounds snapshots by update bucket and releases
         # each bucket after nvCOMP has consumed its GPU-resident parameter XORs.
-        delta_update: BF16DeltaUpdate | None = None
+        delta_update: DeltaUpdate | None = None
         record_delta = delta_optimizer is not None
         if record_delta:
             delta_optimizer.begin_delta(base_step=progress.step - 1, step=progress.step)

@@ -7,9 +7,9 @@ import torch
 import torch.distributed as dist
 
 from prime_rl.trainer.rl.broadcast.nccl_delta import gather_compressed_delta_updates
-from prime_rl.weight_sync.bf16_delta import (
+from prime_rl.weight_sync.xor_delta import (
     NVCOMP_FRAME_ALIGNMENT,
-    BF16DeltaEncoder,
+    DeltaEncoder,
     NvcompLZ4Codec,
     decode_delta_tensors,
     reconstruct_delta_tensors,
@@ -36,7 +36,7 @@ def test_four_rank_compressed_delta_gather_is_byte_exact():
 
     local = torch.full((2, 8), rank + 1, dtype=torch.int16, device=device).view(torch.bfloat16)
     codec = NvcompLZ4Codec(device)
-    encoder = BF16DeltaEncoder(base_step=3, step=4, codec=codec)
+    encoder = DeltaEncoder(base_step=3, step=4, codec=codec)
     encoder.append_sharded_bucket(
         [("weight", local)],
         local.reshape(-1),
@@ -87,7 +87,7 @@ def test_one_missing_rank_forces_collective_full_weight_fallback():
     update = None
     if rank != 3:
         local = torch.zeros((2, 8), dtype=torch.bfloat16, device=device)
-        encoder = BF16DeltaEncoder(base_step=4, step=5, codec=NvcompLZ4Codec(device))
+        encoder = DeltaEncoder(base_step=4, step=5, codec=NvcompLZ4Codec(device))
         encoder.append_sharded_bucket(
             [("weight", local)],
             local.reshape(-1),

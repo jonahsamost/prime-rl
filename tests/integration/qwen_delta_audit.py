@@ -1,4 +1,4 @@
-"""Importable worker callback for the Qwen3 BF16 delta integration test."""
+"""Importable worker callback for the Qwen3 XOR delta integration test."""
 
 from __future__ import annotations
 
@@ -7,16 +7,17 @@ from typing import Any
 import torch
 from torch import nn
 
-from prime_rl.inference.vllm.worker.bf16_delta import (
+from prime_rl.inference.vllm.worker.dense_xor import apply_dense_source_deltas_
+from prime_rl.inference.vllm.worker.xor_delta import (
     DestinationDelta,
-    route_bf16_values_to_named_parameters,
-    route_bf16_values_to_scratch,
-    xor_bf16,
+    route_values_to_named_parameters,
+    route_values_to_scratch,
+    xor_bits,
 )
-from prime_rl.inference.vllm.worker.qwen3_bf16_delta import apply_qwen3_bf16_source_deltas_
+from prime_rl.weight_sync.xor_delta import integer_view
 
 
-def audit_qwen3_bf16_delta(model: nn.Module) -> dict[str, Any]:
+def audit_qwen3_xor_delta(model: nn.Module) -> dict[str, Any]:
     """Audit TP-aware Qwen routing and in-place XOR inside a vLLM worker."""
     layer_index = 0
     layer = model.model.layers[layer_index]
@@ -57,13 +58,13 @@ def audit_qwen3_bf16_delta(model: nn.Module) -> dict[str, Any]:
         for name, shape in source_shapes.items()
     }
     new_source = {
-        name: xor_bf16(value, torch.ones_like(value.view(torch.int16)).view(torch.bfloat16))
+        name: xor_bits(value, torch.ones_like(integer_view(value)).view(torch.bfloat16))
         for name, value in old_source.items()
     }
-    source_delta = {name: xor_bf16(old_source[name], new_source[name]) for name in old_source}
+    source_delta = {name: xor_bits(old_source[name], new_source[name]) for name in old_source}
 
     def route(source: dict[str, torch.Tensor]) -> list[DestinationDelta]:
-        return route_bf16_values_to_scratch(layer, lambda: model.load_weights(source.items()))
+        return route_values_to_scratch(layer, lambda: model.load_weights(source.items()))
 
     def by_name(routed: list[DestinationDelta]) -> dict[str, torch.Tensor]:
         return {name: item.delta for item in routed for name in item.names}
@@ -83,29 +84,29 @@ def audit_qwen3_bf16_delta(model: nn.Module) -> dict[str, Any]:
         "post_attention_layernorm.weight",
     }
     for name in selected_destinations:
-        expected = xor_bf16(old_destinations[name], new_destinations[name])
-        if not torch.equal(delta_destinations[name].view(torch.int16), expected.view(torch.int16)):
+        expected = xor_bits(old_destinations[name], new_destinations[name])
+        if not torch.equal(integer_view(delta_destinations[name]), integer_view(expected)):
             raise AssertionError(f"source XOR did not commute through Qwen's loader for {name}")
 
     live_before = {name: live_parameters[name].detach().clone() for name in selected_destinations}
     pointers_before = {name: live_parameters[name].data_ptr() for name in selected_destinations}
-    apply_qwen3_bf16_source_deltas_(model, source_delta, layer_index=layer_index)
+    apply_dense_source_deltas_(model, source_delta)
     try:
         for name in selected_destinations:
             parameter = live_parameters[name]
             if parameter.data_ptr() != pointers_before[name]:
                 raise AssertionError(f"applying the delta replaced live storage for {name}")
-            expected = xor_bf16(live_before[name], delta_destinations[name])
-            if not torch.equal(parameter.view(torch.int16), expected.view(torch.int16)):
+            expected = xor_bits(live_before[name], delta_destinations[name])
+            if not torch.equal(integer_view(parameter), integer_view(expected)):
                 raise AssertionError(f"applying the routed delta produced incorrect bytes for {name}")
     finally:
-        apply_qwen3_bf16_source_deltas_(model, source_delta, layer_index=layer_index)
+        apply_dense_source_deltas_(model, source_delta)
 
     for name in selected_destinations:
         parameter = live_parameters[name]
         if parameter.data_ptr() != pointers_before[name]:
             raise AssertionError(f"restoring the original bytes replaced live storage for {name}")
-        if not torch.equal(parameter.view(torch.int16), live_before[name].view(torch.int16)):
+        if not torch.equal(integer_view(parameter), integer_view(live_before[name])):
             raise AssertionError(f"failed to restore the original bytes for {name}")
 
     model_parameters = dict(model.named_parameters(remove_duplicate=False))
@@ -121,7 +122,7 @@ def audit_qwen3_bf16_delta(model: nn.Module) -> dict[str, Any]:
         name: torch.ones(shape, dtype=torch.int16, device=device).view(torch.bfloat16)
         for name, shape in non_layer_shapes.items()
     }
-    non_layer_routed = route_bf16_values_to_named_parameters(
+    non_layer_routed = route_values_to_named_parameters(
         [(name, model_parameters[name]) for name in non_layer_delta],
         lambda: model.load_weights(non_layer_delta.items()),
         context="Qwen3 TP non-layer audit",
@@ -129,23 +130,23 @@ def audit_qwen3_bf16_delta(model: nn.Module) -> dict[str, Any]:
     non_layer_by_name = {name: item.delta for item in non_layer_routed for name in item.names}
     non_layer_before = {name: model_parameters[name].detach().clone() for name in non_layer_delta}
     non_layer_pointers = {name: model_parameters[name].data_ptr() for name in non_layer_delta}
-    apply_qwen3_bf16_source_deltas_(model, non_layer_delta, layer_index=-1)
+    apply_dense_source_deltas_(model, non_layer_delta)
     try:
         for name in non_layer_delta:
             parameter = model_parameters[name]
             if parameter.data_ptr() != non_layer_pointers[name]:
                 raise AssertionError(f"applying the delta replaced live storage for {name}")
-            expected = xor_bf16(non_layer_before[name], non_layer_by_name[name])
-            if not torch.equal(parameter.view(torch.int16), expected.view(torch.int16)):
+            expected = xor_bits(non_layer_before[name], non_layer_by_name[name])
+            if not torch.equal(integer_view(parameter), integer_view(expected)):
                 raise AssertionError(f"applying the routed delta produced incorrect bytes for {name}")
     finally:
-        apply_qwen3_bf16_source_deltas_(model, non_layer_delta, layer_index=-1)
+        apply_dense_source_deltas_(model, non_layer_delta)
 
     for name in non_layer_delta:
         parameter = model_parameters[name]
         if parameter.data_ptr() != non_layer_pointers[name]:
             raise AssertionError(f"restoring the original bytes replaced live storage for {name}")
-        if not torch.equal(parameter.view(torch.int16), non_layer_before[name].view(torch.int16)):
+        if not torch.equal(integer_view(parameter), integer_view(non_layer_before[name])):
             raise AssertionError(f"failed to restore the original bytes for {name}")
 
     return {
@@ -156,4 +157,4 @@ def audit_qwen3_bf16_delta(model: nn.Module) -> dict[str, Any]:
     }
 
 
-__all__ = ["audit_qwen3_bf16_delta"]
+__all__ = ["audit_qwen3_xor_delta"]

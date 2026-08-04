@@ -179,7 +179,7 @@ def _create_optimizer(
                 nesterov=config.nesterov,
             )
         case "adamw":
-            if delta_mode == "bf16_xor":
+            if delta_mode == "xor":
                 return DeltaAdamW(
                     params=named_params,
                     lr=lr,

@@ -8,6 +8,7 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 
+from prime_rl.inference.vllm.worker.dense_xor import validate_dense_delta_model
 from prime_rl.inference.vllm.worker.nccl_delta import NCCLDeltaHandler
 from prime_rl.inference.vllm.worker.weight_transfer import (
     load_weights_checkpoint_layerwise,
@@ -15,7 +16,7 @@ from prime_rl.inference.vllm.worker.weight_transfer import (
     update_mla_absorbed_weights,
 )
 from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
-from prime_rl.weight_sync.bf16_delta import (
+from prime_rl.weight_sync.xor_delta import (
     WeightUpdateHeader,
     WeightUpdateKind,
     decode_weight_update_header,
@@ -119,7 +120,7 @@ class NCCLWeightBroadcastReceiver:
         self.communicator = PyNcclCommunicator(pg, device=device)
         self.delta_mode = delta_mode
         self.current_step: int | None = None
-        self.delta_handler = NCCLDeltaHandler(device) if delta_mode == "bf16_xor" else None
+        self.delta_handler = NCCLDeltaHandler(device) if delta_mode == "xor" else None
 
     @torch.no_grad()
     def receive_state_dict(self):
@@ -179,7 +180,13 @@ class NCCLWeightUpdateWorker(Worker):
         self.quantize_in_weight_transfer = quantize_in_weight_transfer
         self.delta_mode = delta_mode
         if self.delta_mode != "none" and self.quantize_in_weight_transfer:
-            raise ValueError("BF16 XOR delta mode is incompatible with quantize_in_weight_transfer")
+            raise ValueError("XOR delta mode is incompatible with quantize_in_weight_transfer")
+        if self.delta_mode == "xor":
+            model = self.model_runner.model
+            if hasattr(model, "runnable"):
+                model = model.runnable
+            assert isinstance(model, Module)
+            validate_dense_delta_model(model)
         # Use the worker's device index directly as the local rank.
         # The previous dp_group-based computation broke in vLLM v1 multiprocess
         # DP mode where each worker is a separate process with a singleton
@@ -217,10 +224,10 @@ class NCCLWeightUpdateWorker(Worker):
 
         del weight_dir
         header = self.nccl_broadcast_receiver.receive_update_header()
-        if header is not None and header.kind == WeightUpdateKind.BF16_XOR:
+        if header is not None and header.kind == WeightUpdateKind.XOR:
             if header.base_step != self.nccl_broadcast_receiver.current_step:
                 raise RuntimeError(
-                    f"cannot apply BF16 delta for step {header.step}: base step {header.base_step} "
+                    f"cannot apply XOR delta for step {header.step}: base step {header.base_step} "
                     f"does not match resident step {self.nccl_broadcast_receiver.current_step}"
                 )
             delta_handler = self.nccl_broadcast_receiver.delta_handler

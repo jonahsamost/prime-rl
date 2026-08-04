@@ -199,7 +199,7 @@ class ModelConfig(BaseModelConfig):
     impl: Literal["hf", "custom", "auto"] = "auto"
     """Model implementation. ``auto`` selects ``custom`` if supported by the model, otherwise ``hf``."""
 
-    optimization_dtype: Literal["bfloat16", "float32"] = "float32"
+    optimization_dtype: Literal["bfloat16", "float16", "float32"] = "float32"
     """dtype for model optimization."""
 
     reduce_dtype: Literal["bfloat16", "float32"] = "float32"
@@ -545,8 +545,8 @@ class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     quantize_in_weight_transfer: bool = False
     """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
 
-    delta_mode: Literal["none", "bf16_xor"] = "none"
-    """Experimental dense-Qwen3 GPU nvCOMP LZ4 BF16 XOR updates.
+    delta_mode: Literal["none", "xor"] = "none"
+    """Experimental dense-model GPU nvCOMP LZ4 XOR updates.
 
     Startup remains a full checkpoint transfer. FSDP ranks compress local
     ``Shard(0)`` deltas before trainer rank 0 gathers them for NCCL broadcast.

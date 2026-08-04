@@ -1,4 +1,4 @@
-"""BF16 XOR delta protocol helpers for the trainer NCCL broadcaster."""
+"""XOR delta protocol helpers for the trainer NCCL broadcaster."""
 
 from __future__ import annotations
 
@@ -10,11 +10,11 @@ import torch.distributed as dist
 from torch import Tensor
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
-from prime_rl.weight_sync.bf16_delta import (
-    BF16DeltaUpdate,
+from prime_rl.weight_sync.xor_delta import (
     CompressedDeltaFrame,
     DeltaTensorMetadata,
-    ShardedBF16DeltaUpdate,
+    DeltaUpdate,
+    ShardedDeltaUpdate,
     packed_delta_nbytes,
     validate_sharded_delta_update,
 )
@@ -24,7 +24,7 @@ BroadcastBytes = Callable[[bytes, PyNcclCommunicator], None]
 
 
 def broadcast_compressed_delta(
-    update: ShardedBF16DeltaUpdate,
+    update: ShardedDeltaUpdate,
     communicator: PyNcclCommunicator,
     *,
     broadcast_tensor: BroadcastTensor,
@@ -36,33 +36,33 @@ def broadcast_compressed_delta(
     for rank, shard in enumerate(update.shards):
         if shard.payload.device != communicator.device:
             raise ValueError(
-                f"BF16 delta payload for trainer rank {rank} is on {shard.payload.device}; "
+                f"XOR delta payload for trainer rank {rank} is on {shard.payload.device}; "
                 f"NCCL communicator uses {communicator.device}"
             )
         broadcast_tensor(shard.payload, communicator)
 
 
-def _serialize_local_delta_metadata(update: BF16DeltaUpdate) -> bytes:
+def _serialize_local_delta_metadata(update: DeltaUpdate) -> bytes:
     return pickle.dumps((update.base_step, update.step, update.tensors, update.frames))
 
 
-def _deserialize_local_delta_metadata(payload: Tensor, compressed_payload: Tensor) -> BF16DeltaUpdate:
+def _deserialize_local_delta_metadata(payload: Tensor, compressed_payload: Tensor) -> DeltaUpdate:
     decoded = pickle.loads(payload.cpu().numpy().tobytes())
     if not isinstance(decoded, tuple) or len(decoded) != 4:
-        raise ValueError("invalid trainer BF16 delta metadata envelope")
+        raise ValueError("invalid trainer XOR delta metadata envelope")
     base_step, step, tensors, frames = decoded
     if not isinstance(base_step, int) or not isinstance(step, int):
-        raise ValueError("trainer BF16 delta metadata has invalid policy versions")
+        raise ValueError("trainer XOR delta metadata has invalid policy versions")
     if not isinstance(tensors, tuple) or not all(isinstance(item, DeltaTensorMetadata) for item in tensors):
-        raise ValueError("trainer BF16 delta metadata has invalid tensor manifest")
+        raise ValueError("trainer XOR delta metadata has invalid tensor manifest")
     if not isinstance(frames, tuple) or not all(isinstance(item, CompressedDeltaFrame) for item in frames):
-        raise ValueError("trainer BF16 delta metadata has invalid frame manifest")
+        raise ValueError("trainer XOR delta metadata has invalid frame manifest")
     if compressed_payload.numel() != packed_delta_nbytes(frames):
         raise ValueError(
-            f"trainer BF16 delta payload has {compressed_payload.numel()} bytes; "
+            f"trainer XOR delta payload has {compressed_payload.numel()} bytes; "
             f"metadata requires {packed_delta_nbytes(frames)}"
         )
-    return BF16DeltaUpdate(
+    return DeltaUpdate(
         base_step=base_step,
         step=step,
         tensors=tensors,
@@ -104,15 +104,15 @@ def _split_gathered_tensor(value: Tensor, sizes: list[int]) -> list[Tensor]:
 
 
 def gather_compressed_delta_updates(
-    local_update: BF16DeltaUpdate | None,
-) -> tuple[ShardedBF16DeltaUpdate | None, bool]:
+    local_update: DeltaUpdate | None,
+) -> tuple[ShardedDeltaUpdate | None, bool]:
     """Gather rank-local compressed FSDP deltas onto trainer rank 0."""
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     rank = dist.get_rank() if dist.is_initialized() else 0
     if world_size == 1:
         if local_update is None:
             return None, False
-        sharded = ShardedBF16DeltaUpdate(
+        sharded = ShardedDeltaUpdate(
             base_step=local_update.base_step,
             step=local_update.step,
             shards=(local_update,),
@@ -161,7 +161,7 @@ def gather_compressed_delta_updates(
         _deserialize_local_delta_metadata(metadata_by_rank[index], payload_by_rank[index])
         for index in range(world_size)
     ]
-    sharded = ShardedBF16DeltaUpdate(
+    sharded = ShardedDeltaUpdate(
         base_step=local_update.base_step,
         step=local_update.step,
         shards=tuple(shards),

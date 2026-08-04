@@ -26,9 +26,9 @@ from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
 from prime_rl.utils.pathing import sync_wait_for_path
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 from prime_rl.utils.vlm import get_layer_prefix
-from prime_rl.weight_sync.bf16_delta import (
-    BF16DeltaUpdate,
-    ShardedBF16DeltaUpdate,
+from prime_rl.weight_sync.xor_delta import (
+    DeltaUpdate,
+    ShardedDeltaUpdate,
     WeightUpdateHeader,
     WeightUpdateKind,
     encode_weight_update_header,
@@ -179,7 +179,7 @@ class NCCLWeightBroadcastSender:
         self.last_broadcast_step: int | None = None
         self._optimizer_start_ns = 0
         if self.delta_mode != "none" and self.quantize_in_weight_transfer:
-            raise ValueError("BF16 XOR delta mode is incompatible with quantize_in_weight_transfer")
+            raise ValueError("XOR delta mode is incompatible with quantize_in_weight_transfer")
 
         if self.world.is_master:
             disable_nccl_p2p_if_unavailable()
@@ -197,7 +197,7 @@ class NCCLWeightBroadcastSender:
         self,
         model: nn.Module,
         step: int,
-        delta_update: BF16DeltaUpdate | None = None,
+        delta_update: DeltaUpdate | None = None,
     ) -> None:
         """Broadcast the state dict of a model into the inference pool using NCCL."""
         self._broadcast_weights(model, step, delta_update)
@@ -212,26 +212,24 @@ class NCCLWeightBroadcastSender:
         self,
         model: nn.Module,
         step: int,
-        delta_update: BF16DeltaUpdate | None,
+        delta_update: DeltaUpdate | None,
     ) -> None:
-        sharded_delta: ShardedBF16DeltaUpdate | None = None
+        sharded_delta: ShardedDeltaUpdate | None = None
         is_delta_update = False
-        if self.delta_mode == "bf16_xor":
+        if self.delta_mode == "xor":
             sharded_delta, is_delta_update = gather_compressed_delta_updates(delta_update)
         if is_delta_update:
             assert delta_update is not None
-            if self.delta_mode != "bf16_xor":
-                raise ValueError("received a BF16 delta update while delta mode is disabled")
+            if self.delta_mode != "xor":
+                raise ValueError("received an XOR delta update while delta mode is disabled")
             if delta_update.step != step:
                 raise ValueError(f"delta step {delta_update.step} does not match broadcast step {step}")
             if delta_update.base_step != self.last_broadcast_step:
                 raise ValueError(
                     f"delta base step {delta_update.base_step} does not match last broadcast {self.last_broadcast_step}"
                 )
-            if getattr(model.config, "model_type", None) != "qwen3":
-                raise ValueError("BF16 XOR delta broadcast currently supports Qwen3 only")
             header = WeightUpdateHeader(
-                WeightUpdateKind.BF16_XOR,
+                WeightUpdateKind.XOR,
                 delta_update.base_step,
                 step,
                 self._optimizer_start_ns,
@@ -314,7 +312,7 @@ class NCCLWeightBroadcast(WeightBroadcast):
         self,
         model: nn.Module,
         step: int,
-        delta_update: BF16DeltaUpdate | None = None,
+        delta_update: DeltaUpdate | None = None,
     ) -> None:
         """Broadcast the state dict of a model into the inference pool using NCCL and notifies the orchestrator."""
         self.logger.debug("Starting broadcasting weights to inference engine via NCCL")

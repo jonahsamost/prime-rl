@@ -361,6 +361,7 @@ transformers_modeling_utils_logger.addFilter(
 
 DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
     "float32": torch.float32,
 }
 

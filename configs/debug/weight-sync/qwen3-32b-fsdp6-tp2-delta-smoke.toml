@@ -47,6 +47,7 @@ type = "subprocess"
 gpu_memory_utilization = 0.5
 
 [inference.model]
+dtype = "bfloat16"
 enforce_eager = true
 max_model_len = 1024
 
@@ -56,7 +57,7 @@ dp = 1
 
 [weight_broadcast]
 type = "nccl"
-delta_mode = "bf16_xor"
+delta_mode = "xor"
 delta_adam_bucket_mb = 256
 delta_pipeline_depth = 2
 
