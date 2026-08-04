@@ -43,6 +43,7 @@ class NCCLDeltaHandler:
         communicator: PyNcclCommunicator,
         header: WeightUpdateHeader,
         *,
+        model_dtype: torch.dtype,
         receive_tensor: ReceiveTensor,
         receive_bytes: ReceiveBytes,
     ) -> None:
@@ -53,7 +54,7 @@ class NCCLDeltaHandler:
             receive_tensor=receive_tensor,
             receive_bytes=receive_bytes,
         )
-        apply_compressed_delta(model, update, codec=self.codec)
+        apply_compressed_delta(model, update, model_dtype=model_dtype, codec=self.codec)
 
 
 def receive_compressed_delta(
@@ -105,6 +106,7 @@ def apply_compressed_delta(
     model: Module,
     update: ShardedDeltaUpdate,
     *,
+    model_dtype: torch.dtype,
     codec: NvcompLZ4Codec,
 ) -> None:
     """Decode FSDP shards and apply one reconstructed source layer at a time."""
@@ -150,7 +152,7 @@ def apply_compressed_delta(
                 [values[group_start:group_end] for values in decoded_shards],
                 [metadata[group_start:group_end] for metadata in metadata_shards],
             )
-            apply_dense_source_deltas_(model, dict(decoded_group))
+            apply_dense_source_deltas_(model, dict(decoded_group), model_dtype=model_dtype)
             del decoded_group
             group_start = group_end
         del decoded_shards, metadata_shards

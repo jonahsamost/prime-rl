@@ -9,7 +9,7 @@ from typing import Any
 import torch
 from torch import nn
 
-from prime_rl.inference.vllm.worker.dense_xor import apply_dense_source_deltas_
+from prime_rl.inference.vllm.worker.dense_xor import apply_dense_source_deltas_, validate_dense_delta_model
 from prime_rl.inference.vllm.worker.xor_delta import (
     DestinationDelta,
     route_values_to_named_parameters,
@@ -45,6 +45,7 @@ def audit_mistral_xor(model: nn.Module) -> dict[str, Any]:
 
 def audit_standard_decoder_xor(model: nn.Module, *, family: str) -> dict[str, Any]:
     """Audit a conventional gated-decoder checkpoint loader and in-place XOR."""
+    model_dtype = validate_dense_delta_model(model)
     config = model.config
     model_type = str(getattr(config, "model_type", ""))
     expected_model_types = _STANDARD_MODEL_TYPES[family]
@@ -57,7 +58,13 @@ def audit_standard_decoder_xor(model: nn.Module, *, family: str) -> dict[str, An
     layer = model.get_submodule(layer_path)
     text_config = _text_config(config)
     source_shapes = _standard_layer_source_shapes(layer, text_config, prefix=f"{layer_path}.")
-    layer_result = _audit_source_group(model, source_shapes, destination_root=layer, context=f"{family} layer 0")
+    layer_result = _audit_source_group(
+        model,
+        source_shapes,
+        model_dtype=model_dtype,
+        destination_root=layer,
+        context=f"{family} layer 0",
+    )
 
     model_parameters = dict(model.named_parameters(remove_duplicate=False))
     hidden_size = int(text_config.hidden_size)
@@ -84,7 +91,13 @@ def audit_standard_decoder_xor(model: nn.Module, *, family: str) -> dict[str, An
 
     non_layer_destinations = 0
     for name, shape in non_layer_shapes.items():
-        result = _audit_source_group(model, {name: shape}, destination_root=None, context=f"{family} {name}")
+        result = _audit_source_group(
+            model,
+            {name: shape},
+            model_dtype=model_dtype,
+            destination_root=None,
+            context=f"{family} {name}",
+        )
         non_layer_destinations += result["destination_parameters_checked"]
 
     return {
@@ -144,6 +157,7 @@ def _audit_source_group(
     model: nn.Module,
     source_shapes: dict[str, tuple[int, ...]],
     *,
+    model_dtype: torch.dtype,
     destination_root: nn.Module | None,
     context: str,
 ) -> dict[str, int]:
@@ -198,7 +212,7 @@ def _audit_source_group(
 
     live_before = {name: parameter.detach().clone() for name, parameter in destination_parameters.items()}
     pointers_before = {name: parameter.data_ptr() for name, parameter in destination_parameters.items()}
-    apply_dense_source_deltas_(model, source_delta)
+    apply_dense_source_deltas_(model, source_delta, model_dtype=model_dtype)
     try:
         for name, parameter in destination_parameters.items():
             if parameter.data_ptr() != pointers_before[name]:
@@ -207,7 +221,7 @@ def _audit_source_group(
             if not torch.equal(integer_view(parameter), integer_view(expected)):
                 raise AssertionError(f"applying {context} delta produced incorrect bytes for {name}")
     finally:
-        apply_dense_source_deltas_(model, source_delta)
+        apply_dense_source_deltas_(model, source_delta, model_dtype=model_dtype)
 
     for name, parameter in destination_parameters.items():
         if parameter.data_ptr() != pointers_before[name]:

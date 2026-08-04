@@ -274,7 +274,7 @@ def test_dense_adapter_applies_conventional_layer_deltas(dtype):
     source_delta = {name: xor_bits(old_source[name], new_source[name]) for name in old_source}
     model.load_weights(old_source.items())
 
-    apply_dense_source_deltas_(model, source_delta)
+    apply_dense_source_deltas_(model, source_delta, model_dtype=validate_dense_delta_model(model))
 
     expected = _by_name(route_values_to_scratch(model.layer, lambda: model.load_weights(new_source.items())))
     for name, parameter in _live_by_name(model).items():

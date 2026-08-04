@@ -43,9 +43,13 @@ def validate_dense_delta_model(model: nn.Module) -> torch.dtype:
 
 
 @torch.no_grad()
-def apply_dense_source_deltas_(model: nn.Module, source_deltas: dict[str, torch.Tensor]) -> int:
+def apply_dense_source_deltas_(
+    model: nn.Module,
+    source_deltas: dict[str, torch.Tensor],
+    *,
+    model_dtype: torch.dtype,
+) -> int:
     """Route one source-layout parameter group and XOR it into live vLLM weights."""
-    model_dtype = validate_dense_delta_model(model)
     if not source_deltas:
         return 0
     source_dtypes = {value.dtype for value in source_deltas.values()}

@@ -186,7 +186,9 @@ class NCCLWeightUpdateWorker(Worker):
             if hasattr(model, "runnable"):
                 model = model.runnable
             assert isinstance(model, Module)
-            validate_dense_delta_model(model)
+            self.delta_model_dtype = validate_dense_delta_model(model)
+        else:
+            self.delta_model_dtype = None
         # Use the worker's device index directly as the local rank.
         # The previous dp_group-based computation broke in vLLM v1 multiprocess
         # DP mode where each worker is a separate process with a singleton
@@ -232,10 +234,12 @@ class NCCLWeightUpdateWorker(Worker):
                 )
             delta_handler = self.nccl_broadcast_receiver.delta_handler
             assert delta_handler is not None
+            assert self.delta_model_dtype is not None
             delta_handler.receive_and_apply(
                 model,
                 self.nccl_broadcast_receiver.communicator,
                 header,
+                model_dtype=self.delta_model_dtype,
                 receive_tensor=_receive_tensor,
                 receive_bytes=receive_bytes,
             )
