@@ -78,6 +78,7 @@ def test_nvcomp_lz4_cuda_encode_decode_round_trip_is_byte_exact(dtype):
     assert update.step == 5
     assert update.payload.device == device
     assert update.payload.dtype == torch.uint8
+    assert update.payload.numel() % 256 == 0
     assert len(update.tensors) == 3
     assert len(update.frames) == 2
     assert update.frames[0].first_tensor_index == 0

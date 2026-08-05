@@ -147,9 +147,11 @@ class DeltaUpdate:
             offset = _align_up(offset, NVCOMP_FRAME_ALIGNMENT)
             yield self.payload.narrow(0, offset, frame.compressed_nbytes)
             offset += frame.compressed_nbytes
-        if offset != self.compressed_nbytes:
+        packed_nbytes = _align_up(offset, NVCOMP_FRAME_ALIGNMENT)
+        if packed_nbytes != self.compressed_nbytes:
             raise ValueError(
-                f"compressed frame metadata describes {offset} bytes but payload has {self.compressed_nbytes}"
+                f"compressed frame metadata describes {packed_nbytes} aligned bytes "
+                f"but payload has {self.compressed_nbytes}"
             )
 
 
@@ -244,6 +246,7 @@ class NvcompLZ4Codec:
             )
         self._compression_configs: dict[tuple[int, ...], Any] = {}
         self._decompression_configs: dict[tuple[int, ...], Any] = {}
+        self._packed_capacity_hint = 0
 
     def encode(
         self,
@@ -306,20 +309,30 @@ class NvcompLZ4Codec:
             ]
         return payloads
 
-    def pack(
+    def copy_encoded(
         self,
-        payloads: Sequence[Tensor],
-    ) -> Tensor:
-        if not payloads:
-            return torch.empty(0, dtype=torch.uint8, device=self.device)
+        pending: PendingNvcompEncode,
+        destinations: Sequence[Tensor],
+        compressed_sizes: Sequence[int],
+    ) -> None:
+        if len(pending.encoded) != len(destinations) or len(destinations) != len(compressed_sizes):
+            raise ValueError(
+                f"received {len(destinations)} destinations and {len(compressed_sizes)} sizes "
+                f"for {len(pending.encoded)} encoded values"
+            )
         with torch.cuda.stream(self.stream):
-            packed = torch.empty(_packed_nbytes(payloads), dtype=torch.uint8, device=self.device)
-            offset = 0
-            for payload in payloads:
-                offset = _align_up(offset, NVCOMP_FRAME_ALIGNMENT)
-                packed.narrow(0, offset, payload.numel()).copy_(payload)
-                offset += payload.numel()
-        return packed
+            for buffer, compressed_size, destination in zip(
+                pending.output_buffers,
+                compressed_sizes,
+                destinations,
+                strict=True,
+            ):
+                if destination.dtype != torch.uint8 or destination.numel() != compressed_size:
+                    raise ValueError(
+                        f"encoded destination has dtype={destination.dtype}, nbytes={destination.numel()}; "
+                        f"expected uint8 with {compressed_size} bytes"
+                    )
+                destination.copy_(buffer.narrow(0, 0, compressed_size))
 
     def decode(
         self,
@@ -399,7 +412,8 @@ class DeltaEncoder:
         self.pipeline_depth = pipeline_depth
         self._tensors: list[DeltaTensorMetadata] = []
         self._frames: list[CompressedDeltaFrame] = []
-        self._payloads: list[Tensor] = []
+        self._payload: Tensor | None = None
+        self._payload_size = 0
         self._pending: deque[PendingDeltaFrame] = deque()
         self._finished = False
 
@@ -512,7 +526,14 @@ class DeltaEncoder:
         self._finished = True
         while self._pending:
             self._finalize_oldest()
-        packed = self.codec.pack(self._payloads)
+        packed_nbytes = _align_up(self._payload_size, NVCOMP_FRAME_ALIGNMENT)
+        self._reserve_payload(packed_nbytes)
+        assert self._payload is not None
+        packed = self._payload.narrow(0, 0, packed_nbytes)
+        self.codec._packed_capacity_hint = _align_up(
+            packed_nbytes + packed_nbytes // 8,
+            NVCOMP_FRAME_ALIGNMENT,
+        )
         self.codec.synchronize()
         update = DeltaUpdate(
             base_step=self.base_step,
@@ -531,19 +552,41 @@ class DeltaEncoder:
 
     def _finalize_oldest(self) -> None:
         pending = self._pending.popleft()
-        payloads = self.codec.finalize_encode(pending.encode)
-        if len(payloads) != 1:
-            raise RuntimeError(f"nvCOMP returned {len(payloads)} frames for one XOR delta bucket")
-        payload = payloads[0]
+        compressed_sizes = tuple(item.buffer_size for item in pending.encode.encoded)
+        if len(compressed_sizes) != 1:
+            raise RuntimeError(f"nvCOMP returned {len(compressed_sizes)} frames for one XOR delta bucket")
+        compressed_nbytes = compressed_sizes[0]
+        offset = _align_up(self._payload_size, NVCOMP_FRAME_ALIGNMENT)
+        self._reserve_payload(offset + compressed_nbytes)
+        assert self._payload is not None
+        destination = self._payload.narrow(0, offset, compressed_nbytes)
+        self.codec.copy_encoded(pending.encode, [destination], compressed_sizes)
+        self._payload_size = offset + compressed_nbytes
         self._frames.append(
             CompressedDeltaFrame(
                 first_tensor_index=pending.first_tensor_index,
                 tensor_count=pending.tensor_count,
                 uncompressed_nbytes=pending.uncompressed_nbytes,
-                compressed_nbytes=payload.numel() * payload.element_size(),
+                compressed_nbytes=compressed_nbytes,
             )
         )
-        self._payloads.append(payload)
+
+    def _reserve_payload(self, required: int) -> None:
+        if self._payload is not None and self._payload.numel() >= required:
+            return
+        current_capacity = 0 if self._payload is None else self._payload.numel()
+        capacity = _align_up(
+            max(required, self.codec._packed_capacity_hint, max(NVCOMP_FRAME_ALIGNMENT, current_capacity * 2)),
+            NVCOMP_FRAME_ALIGNMENT,
+        )
+        replacement = torch.empty(capacity, dtype=torch.uint8, device=self.codec.device)
+        if self._payload is not None and self._payload_size:
+            self._payload.record_stream(self.codec.stream)
+            with torch.cuda.stream(self.codec.stream):
+                replacement.narrow(0, 0, self._payload_size).copy_(
+                    self._payload.narrow(0, 0, self._payload_size)
+                )
+        self._payload = replacement
 
     @staticmethod
     def _normalize_values(values: Sequence[tuple[str, Tensor]]) -> list[tuple[str, Tensor]]:
@@ -576,17 +619,33 @@ def decode_delta_tensors(
     )
     values: list[tuple[str, Tensor]] = []
     for frame, raw in zip(frames, decoded, strict=True):
-        offset = 0
-        frame_tensors = tensors[frame.first_tensor_index : frame.first_tensor_index + frame.tensor_count]
-        for metadata in frame_tensors:
-            tensor_bytes = raw.narrow(0, offset, metadata.nbytes)
-            dtype = delta_dtype_from_name(metadata.dtype)
-            values.append((metadata.name, tensor_bytes.view(dtype).view(metadata.shape)))
-            offset += metadata.nbytes
-        if offset != frame.uncompressed_nbytes:
-            raise ValueError(
-                f"decoded XOR delta frame describes {offset} tensor bytes; expected {frame.uncompressed_nbytes}"
-            )
+        values.extend(unpack_delta_frame(raw, tensors, frame))
+    return values
+
+
+def unpack_delta_frame(
+    raw: Tensor,
+    tensors: Sequence[DeltaTensorMetadata],
+    frame: CompressedDeltaFrame,
+) -> list[tuple[str, Tensor]]:
+    """Split one decoded frame into its typed tensor views."""
+    if raw.dtype != torch.uint8 or raw.numel() != frame.uncompressed_nbytes:
+        raise ValueError(
+            f"decoded XOR delta frame has dtype={raw.dtype}, nbytes={raw.numel()}; "
+            f"expected uint8 with {frame.uncompressed_nbytes} bytes"
+        )
+    values: list[tuple[str, Tensor]] = []
+    offset = 0
+    frame_tensors = tensors[frame.first_tensor_index : frame.first_tensor_index + frame.tensor_count]
+    for metadata in frame_tensors:
+        tensor_bytes = raw.narrow(0, offset, metadata.nbytes)
+        dtype = delta_dtype_from_name(metadata.dtype)
+        values.append((metadata.name, tensor_bytes.view(dtype).view(metadata.shape)))
+        offset += metadata.nbytes
+    if offset != frame.uncompressed_nbytes:
+        raise ValueError(
+            f"decoded XOR delta frame describes {offset} tensor bytes; expected {frame.uncompressed_nbytes}"
+        )
     return values
 
 
@@ -777,18 +836,11 @@ def _align_up(value: int, alignment: int) -> int:
 
 
 def packed_delta_nbytes(frames: Sequence[CompressedDeltaFrame]) -> int:
-    """Return the CUDA payload size including inter-frame alignment padding."""
+    """Return the CUDA payload size including frame and terminal alignment."""
     size = 0
     for frame in frames:
         size = _align_up(size, NVCOMP_FRAME_ALIGNMENT) + frame.compressed_nbytes
-    return size
-
-
-def _packed_nbytes(payloads: Sequence[Tensor]) -> int:
-    size = 0
-    for payload in payloads:
-        size = _align_up(size, NVCOMP_FRAME_ALIGNMENT) + payload.numel()
-    return size
+    return _align_up(size, NVCOMP_FRAME_ALIGNMENT)
 
 
 __all__ = [
@@ -811,6 +863,7 @@ __all__ = [
     "local_tensor",
     "packed_delta_nbytes",
     "reconstruct_delta_tensors",
+    "unpack_delta_frame",
     "validate_delta_update",
     "validate_sharded_delta_update",
 ]

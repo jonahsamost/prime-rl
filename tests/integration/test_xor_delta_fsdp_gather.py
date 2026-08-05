@@ -11,8 +11,8 @@ from prime_rl.weight_sync.xor_delta import (
     NVCOMP_FRAME_ALIGNMENT,
     DeltaEncoder,
     NvcompLZ4Codec,
-    decode_delta_tensors,
     reconstruct_delta_tensors,
+    unpack_delta_frame,
 )
 
 pytestmark = [pytest.mark.gpu, pytest.mark.slow]
@@ -52,19 +52,19 @@ def test_four_rank_compressed_delta_gather_is_byte_exact():
     if rank == 0:
         assert gathered is not None
         assert all(shard.payload.data_ptr() % NVCOMP_FRAME_ALIGNMENT == 0 for shard in gathered.shards)
-        decoded_shards = []
-        metadata_shards = []
-        for shard in gathered.shards:
-            codec = NvcompLZ4Codec(device)
-            decoded = decode_delta_tensors(
-                codec,
-                shard.tensors,
-                shard.frames,
-                list(shard.frame_payloads()),
-            )
-            codec.synchronize()
-            decoded_shards.append(decoded)
-            metadata_shards.append(shard.tensors)
+        assert len({shard.payload.untyped_storage().data_ptr() for shard in gathered.shards}) == 1
+        frames = [shard.frames[0] for shard in gathered.shards]
+        codec = NvcompLZ4Codec(device)
+        decoded_frames = codec.decode(
+            [next(shard.frame_payloads()) for shard in gathered.shards],
+            [frame.uncompressed_nbytes for frame in frames],
+        )
+        codec.synchronize()
+        decoded_shards = [
+            unpack_delta_frame(decoded, shard.tensors, frame)
+            for decoded, shard, frame in zip(decoded_frames, gathered.shards, frames, strict=True)
+        ]
+        metadata_shards = [shard.tensors for shard in gathered.shards]
         reconstructed = dict(reconstruct_delta_tensors(decoded_shards, metadata_shards))["weight"]
         expected = torch.cat([torch.full((2, 8), index + 1, dtype=torch.int16, device=device) for index in range(4)])
         assert torch.equal(reconstructed.view(torch.int16), expected)

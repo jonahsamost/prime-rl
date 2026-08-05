@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from prime_rl.inference.vllm.worker.dense_xor import (
+    DenseDeltaRouter,
     apply_dense_source_deltas_,
     source_layer_module_path,
     validate_dense_delta_model,
@@ -277,6 +278,26 @@ def test_dense_adapter_applies_conventional_layer_deltas(dtype):
     apply_dense_source_deltas_(model, source_delta, model_dtype=validate_dense_delta_model(model))
 
     expected = _by_name(route_values_to_scratch(model.layer, lambda: model.load_weights(new_source.items())))
+    for name, parameter in _live_by_name(model).items():
+        assert torch.equal(integer_view(parameter), integer_view(expected[name])), name
+
+
+def test_dense_router_reuses_a_validated_layer_plan():
+    model = _ToyDenseVllmModel(torch.bfloat16)
+    prefix = "model.layers.0."
+    old_source = {prefix + name: value for name, value in _make_source_state(20).items()}
+    new_source = {prefix + name: value for name, value in _make_source_state(21).items()}
+    source_delta = {name: xor_bits(old_source[name], new_source[name]) for name in old_source}
+    model.load_weights(old_source.items())
+    router = DenseDeltaRouter(model, validate_dense_delta_model(model))
+
+    router.apply(source_delta, layer_path="model.layers.0")
+    plan = next(iter(router._plans.values()))
+    router.apply(source_delta, layer_path="model.layers.0")
+
+    assert len(router._plans) == 1
+    assert next(iter(router._plans.values())) is plan
+    expected = _by_name(route_values_to_scratch(model.layer, lambda: model.load_weights(old_source.items())))
     for name, parameter in _live_by_name(model).items():
         assert torch.equal(integer_view(parameter), integer_view(expected[name])), name
 

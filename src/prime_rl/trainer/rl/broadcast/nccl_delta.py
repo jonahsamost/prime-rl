@@ -14,6 +14,7 @@ from prime_rl.weight_sync.xor_delta import (
     CompressedDeltaFrame,
     DeltaTensorMetadata,
     DeltaUpdate,
+    NVCOMP_FRAME_ALIGNMENT,
     ShardedDeltaUpdate,
     packed_delta_nbytes,
     validate_sharded_delta_update,
@@ -148,10 +149,11 @@ def gather_compressed_delta_updates(
     if rank == 0:
         assert gathered_metadata is not None and gathered_payload is not None
         metadata_by_rank = _split_gathered_tensor(gathered_metadata, metadata_sizes)
-        # Variable rank segments are not guaranteed to begin on nvCOMP's
-        # required alignment. Clone each compressed segment into its own CUDA
-        # allocation without ever reconstructing an uncompressed delta here.
-        payload_by_rank = [piece.clone() for piece in _split_gathered_tensor(gathered_payload, payload_sizes)]
+        # Encoder payloads include terminal padding, so every rank segment starts
+        # aligned inside the gathered allocation and can remain a zero-copy view.
+        payload_by_rank = _split_gathered_tensor(gathered_payload, payload_sizes)
+        if any(piece.data_ptr() % NVCOMP_FRAME_ALIGNMENT for piece in payload_by_rank):
+            raise ValueError("gathered XOR delta payload is not aligned by trainer rank")
     dist.barrier()
 
     if rank != 0:

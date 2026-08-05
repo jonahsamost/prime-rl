@@ -7,9 +7,11 @@ from torch import nn
 
 from prime_rl.inference.vllm.worker.xor_delta import (
     DeltaError,
+    ParameterRoutingPlan,
     apply_deltas_,
-    route_values_to_named_parameters,
-    route_values_to_scratch,
+    named_parameter_routing_plan,
+    parameter_routing_plan,
+    route_values_with_plan,
 )
 from prime_rl.weight_sync.xor_delta import SUPPORTED_DELTA_DTYPES
 
@@ -42,6 +44,62 @@ def validate_dense_delta_model(model: nn.Module) -> torch.dtype:
     return dtype
 
 
+class DenseDeltaRouter:
+    """Cache model-layout routing plans while applying changing XOR values."""
+
+    def __init__(self, model: nn.Module, model_dtype: torch.dtype) -> None:
+        self.model = model
+        self.model_dtype = model_dtype
+        self._model_parameters = dict(model.named_parameters(remove_duplicate=False))
+        self._plans: dict[tuple[str | None, tuple[str, ...]], ParameterRoutingPlan] = {}
+
+    @torch.no_grad()
+    def apply(self, source_deltas: dict[str, torch.Tensor], *, layer_path: str | None) -> int:
+        if not source_deltas:
+            return 0
+        source_dtypes = {value.dtype for value in source_deltas.values()}
+        if source_dtypes != {self.model_dtype}:
+            raise DeltaError(
+                f"source delta dtypes {sorted(map(str, source_dtypes))} "
+                f"do not match model storage dtype {self.model_dtype}"
+            )
+
+        source_names = tuple(source_deltas)
+        key = (layer_path, source_names)
+        plan = self._plans.get(key)
+        if plan is None:
+            actual_paths = {_layer_module_path(name) for name in source_names}
+            if actual_paths != {layer_path}:
+                raise DeltaError(
+                    f"XOR delta group expected layer {layer_path!r}, got "
+                    f"{sorted(actual_paths, key=str)}"
+                )
+            plan = self._make_plan(source_names, layer_path)
+            self._plans[key] = plan
+
+        load = lambda: self.model.load_weights(source_deltas.items())
+        routed = route_values_with_plan(plan, load)
+        apply_deltas_(routed)
+        return len(routed)
+
+    def _make_plan(self, source_names: tuple[str, ...], layer_path: str | None) -> ParameterRoutingPlan:
+        if layer_path is not None:
+            try:
+                layer = self.model.get_submodule(layer_path)
+            except AttributeError as error:
+                raise DeltaError(
+                    f"source delta names resolve to layer {layer_path!r}, "
+                    f"but {type(self.model).__name__} has no such module"
+                ) from error
+            return parameter_routing_plan(layer)
+
+        missing = set(source_names) - self._model_parameters.keys()
+        if missing:
+            raise DeltaError(f"non-layer source deltas have no direct vLLM destination: {sorted(missing)}")
+        selected = [(name, self._model_parameters[name]) for name in source_names]
+        return named_parameter_routing_plan(selected, context="dense non-layer parameters")
+
+
 @torch.no_grad()
 def apply_dense_source_deltas_(
     model: nn.Module,
@@ -52,36 +110,11 @@ def apply_dense_source_deltas_(
     """Route one source-layout parameter group and XOR it into live vLLM weights."""
     if not source_deltas:
         return 0
-    source_dtypes = {value.dtype for value in source_deltas.values()}
-    if source_dtypes != {model_dtype}:
-        raise DeltaError(
-            f"source delta dtypes {sorted(map(str, source_dtypes))} do not match model storage dtype {model_dtype}"
-        )
-
     layer_paths = {_layer_module_path(name) for name in source_deltas}
     if len(layer_paths) != 1:
         raise DeltaError(f"XOR delta group spans multiple layer modules: {sorted(layer_paths, key=str)}")
-
-    load = lambda: model.load_weights(source_deltas.items())
     layer_path = layer_paths.pop()
-    if layer_path is not None:
-        try:
-            layer = model.get_submodule(layer_path)
-        except AttributeError as error:
-            raise DeltaError(
-                f"source delta names resolve to layer {layer_path!r}, but {type(model).__name__} has no such module"
-            ) from error
-        routed = route_values_to_scratch(layer, load)
-    else:
-        model_parameters = dict(model.named_parameters(remove_duplicate=False))
-        missing = source_deltas.keys() - model_parameters.keys()
-        if missing:
-            raise DeltaError(f"non-layer source deltas have no direct vLLM destination: {sorted(missing)}")
-        selected = [(name, model_parameters[name]) for name in source_deltas]
-        routed = route_values_to_named_parameters(selected, load, context="dense non-layer parameters")
-
-    apply_deltas_(routed)
-    return len(routed)
+    return DenseDeltaRouter(model, model_dtype).apply(source_deltas, layer_path=layer_path)
 
 
 def source_layer_module_path(name: str) -> str | None:
@@ -102,4 +135,9 @@ def _enabled_expert_field(config, field: str) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 1
 
 
-__all__ = ["apply_dense_source_deltas_", "source_layer_module_path", "validate_dense_delta_model"]
+__all__ = [
+    "DenseDeltaRouter",
+    "apply_dense_source_deltas_",
+    "source_layer_module_path",
+    "validate_dense_delta_model",
+]

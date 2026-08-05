@@ -50,6 +50,20 @@ class _ParameterSlot:
     parameter: nn.Parameter
 
 
+@dataclass(frozen=True)
+class _ParameterRoutingEntry:
+    names: tuple[str, ...]
+    parameter: nn.Parameter
+    data_ptr: int
+
+
+@dataclass(frozen=True)
+class ParameterRoutingPlan:
+    """Validated, stable destination parameters for repeated loader routing."""
+
+    entries: tuple[_ParameterRoutingEntry, ...]
+
+
 def xor_bits(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     """Return the exact bitwise XOR of two supported floating-point tensors."""
     _validate_pair(left, right, context="source XOR")
@@ -79,11 +93,7 @@ def route_values_to_scratch(
     also rejects distinct parameters sharing storage; exact aliases of the same
     ``Parameter`` object are preserved and represented by one destination.
     """
-    return _route_parameter_slots(
-        _collect_parameter_slots(layer),
-        load_values,
-        context=type(layer).__name__,
-    )
+    return route_values_with_plan(parameter_routing_plan(layer), load_values)
 
 
 @torch.no_grad()
@@ -94,68 +104,92 @@ def route_values_to_named_parameters(
     context: str = "parameter selection",
 ) -> list[DestinationDelta]:
     """Route values into scratch for an explicit bounded parameter selection."""
+    return route_values_with_plan(named_parameter_routing_plan(named_parameters, context=context), load_values)
+
+
+def parameter_routing_plan(root: nn.Module) -> ParameterRoutingPlan:
+    return _build_parameter_routing_plan(_collect_parameter_slots(root), context=type(root).__name__)
+
+
+def named_parameter_routing_plan(
+    named_parameters: Iterable[tuple[str, nn.Parameter]],
+    *,
+    context: str = "parameter selection",
+) -> ParameterRoutingPlan:
     slots = [
         _ParameterSlot(owner=None, local_name=name.rsplit(".", 1)[-1], qualified_name=name, parameter=parameter)
         for name, parameter in named_parameters
     ]
-    return _route_parameter_slots(slots, load_values, context=context)
+    return _build_parameter_routing_plan(slots, context=context)
 
 
-def _route_parameter_slots(
-    slots: list[_ParameterSlot],
-    load_values: Callable[[], Any],
-    *,
-    context: str,
-) -> list[DestinationDelta]:
+def _build_parameter_routing_plan(slots: list[_ParameterSlot], *, context: str) -> ParameterRoutingPlan:
     if not slots:
         raise DeltaError(f"{context} has no parameters to route")
 
-    scratch_by_parameter: dict[int, torch.Tensor] = {}
-    original_data_by_parameter: dict[int, torch.Tensor] = {}
+    parameters: dict[int, nn.Parameter] = {}
     names_by_parameter: dict[int, list[str]] = {}
-    live_by_parameter: dict[int, nn.Parameter] = {}
-    pointers_by_parameter: dict[int, int] = {}
     storage_owners: dict[tuple[str, int | None, int], nn.Parameter] = {}
-
     for slot in slots:
         parameter = slot.parameter
         parameter_id = id(parameter)
         _validate_destination_parameter(slot.qualified_name, parameter)
         _reject_distinct_shared_storage(slot.qualified_name, parameter, storage_owners)
-
+        parameters.setdefault(parameter_id, parameter)
         names_by_parameter.setdefault(parameter_id, []).append(slot.qualified_name)
-        live_by_parameter[parameter_id] = parameter
-        pointers_by_parameter[parameter_id] = parameter.data_ptr()
-        if parameter_id not in scratch_by_parameter:
-            original_data_by_parameter[parameter_id] = parameter.data
-            scratch_by_parameter[parameter_id] = torch.zeros_like(parameter, memory_format=torch.preserve_format)
 
-    try:
-        for parameter_id, parameter in live_by_parameter.items():
-            parameter.data = scratch_by_parameter[parameter_id]
-        load_values()
-        _validate_scratch_storage(live_by_parameter, scratch_by_parameter, names_by_parameter)
-    finally:
-        for parameter_id, parameter in live_by_parameter.items():
-            parameter.data = original_data_by_parameter[parameter_id]
-
-    deltas: list[DestinationDelta] = []
-    for parameter_id, parameter in live_by_parameter.items():
-        expected_ptr = pointers_by_parameter[parameter_id]
-        if parameter.data_ptr() != expected_ptr:
-            raise DeltaError(
-                f"live storage pointer changed for {names_by_parameter[parameter_id]}: "
-                f"expected {expected_ptr}, got {parameter.data_ptr()}"
-            )
-        deltas.append(
-            DestinationDelta(
+    return ParameterRoutingPlan(
+        entries=tuple(
+            _ParameterRoutingEntry(
                 names=tuple(names_by_parameter[parameter_id]),
                 parameter=parameter,
-                delta=scratch_by_parameter[parameter_id],
-                data_ptr=expected_ptr,
+                data_ptr=parameter.data_ptr(),
             )
+            for parameter_id, parameter in parameters.items()
+        ),
+    )
+
+
+def route_values_with_plan(
+    plan: ParameterRoutingPlan,
+    load_values: Callable[[], Any],
+) -> list[DestinationDelta]:
+    original_data: list[torch.Tensor] = []
+    scratch: list[torch.Tensor] = []
+    for entry in plan.entries:
+        if entry.parameter.data_ptr() != entry.data_ptr:
+            raise DeltaError(
+                f"live storage pointer changed for {entry.names}: expected {entry.data_ptr}, "
+                f"got {entry.parameter.data_ptr()}"
+            )
+        original_data.append(entry.parameter.data)
+        scratch.append(torch.zeros_like(entry.parameter, memory_format=torch.preserve_format))
+
+    try:
+        for entry, value in zip(plan.entries, scratch, strict=True):
+            entry.parameter.data = value
+        load_values()
+        for entry, expected in zip(plan.entries, scratch, strict=True):
+            _validate_scratch_storage(entry.parameter, expected, entry.names)
+    finally:
+        for entry, value in zip(plan.entries, original_data, strict=True):
+            entry.parameter.data = value
+
+    for entry in plan.entries:
+        if entry.parameter.data_ptr() != entry.data_ptr:
+            raise DeltaError(
+                f"live storage pointer changed for {entry.names}: expected {entry.data_ptr}, "
+                f"got {entry.parameter.data_ptr()}"
+            )
+    return [
+        DestinationDelta(
+            names=entry.names,
+            parameter=entry.parameter,
+            delta=value,
+            data_ptr=entry.data_ptr,
         )
-    return deltas
+        for entry, value in zip(plan.entries, scratch, strict=True)
+    ]
 
 
 @torch.no_grad()
@@ -243,31 +277,32 @@ def _reject_distinct_shared_storage(
 
 
 def _validate_scratch_storage(
-    live_by_parameter: dict[int, nn.Parameter],
-    scratch_by_parameter: dict[int, torch.Tensor],
-    names_by_parameter: dict[int, list[str]],
+    parameter: nn.Parameter,
+    expected: torch.Tensor,
+    names: tuple[str, ...],
 ) -> None:
-    for parameter_id, parameter in live_by_parameter.items():
-        expected = scratch_by_parameter[parameter_id]
-        actual = parameter.data
-        if actual.data_ptr() != expected.data_ptr():
-            raise DeltaError(
-                f"weight loader replaced scratch storage for {names_by_parameter[parameter_id]}; "
-                "only in-place loading is supported"
-            )
-        if actual.dtype != expected.dtype or actual.shape != expected.shape:
-            raise DeltaError(
-                f"weight loader changed scratch metadata for {names_by_parameter[parameter_id]}: "
-                f"expected dtype={expected.dtype}, shape={tuple(expected.shape)}, "
-                f"got dtype={actual.dtype}, shape={tuple(actual.shape)}"
-            )
+    actual = parameter.data
+    if actual.data_ptr() != expected.data_ptr():
+        raise DeltaError(
+            f"weight loader replaced scratch storage for {names}; only in-place loading is supported"
+        )
+    if actual.dtype != expected.dtype or actual.shape != expected.shape:
+        raise DeltaError(
+            f"weight loader changed scratch metadata for {names}: "
+            f"expected dtype={expected.dtype}, shape={tuple(expected.shape)}, "
+            f"got dtype={actual.dtype}, shape={tuple(actual.shape)}"
+        )
 
 
 __all__ = [
     "DeltaError",
     "DestinationDelta",
+    "ParameterRoutingPlan",
     "apply_deltas_",
+    "named_parameter_routing_plan",
+    "parameter_routing_plan",
     "route_values_to_named_parameters",
     "route_values_to_scratch",
+    "route_values_with_plan",
     "xor_bits",
 ]
