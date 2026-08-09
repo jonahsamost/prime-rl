@@ -18,6 +18,8 @@ from prime_rl.utils.logger import format_time, get_logger
 from prime_rl.utils.pathing import get_broadcast_dir, get_step_path, wait_for_path
 from prime_rl.utils.utils import get_latest_ckpt_step
 
+MODEL_EXPRESS_POLL_INTERVAL = 0.05
+
 
 class WeightWatcher:
     """``await watcher.start()`` to drive the polling loop until ``stop()``."""
@@ -58,7 +60,10 @@ class WeightWatcher:
                 next_step = self.compute_next_ckpt_step()
                 if next_step > self.ckpt_step:
                     await self.apply_policy_update(next_step)
-                await asyncio.sleep(self.poll_interval)
+                poll_interval = (
+                    MODEL_EXPRESS_POLL_INTERVAL if self.model_express is not None else self.poll_interval
+                )
+                await asyncio.sleep(poll_interval)
         except asyncio.CancelledError:
             return
 
@@ -145,6 +150,11 @@ class WeightWatcher:
                 self.inference.update_model_name(self.lora_name)
                 self.policy.model_name = self.lora_name
 
+            if self.model_express is not None:
+                # The trainer holds INITIALIZING until an observer acknowledges
+                # this cycle, so the reset cannot be lost between polling ticks.
+                await self.wait_for_model_express_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+
             for observer in self.observers:
                 try:
                     await observer.on_new_version(next_step)
@@ -152,9 +162,6 @@ class WeightWatcher:
                     get_logger().warning(
                         f"Observer {type(observer).__name__}.on_new_version({next_step}) raised: {exc!r}"
                     )
-
-            if self.model_express is not None:
-                await self.wait_for_model_express_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
 
     async def wait_for_model_express_status(self, status: int) -> None:
         while not self.stopped.is_set():
@@ -165,7 +172,7 @@ class WeightWatcher:
             )
             if found:
                 return
-            await asyncio.sleep(self.poll_interval)
+            await asyncio.sleep(MODEL_EXPRESS_POLL_INTERVAL)
         raise asyncio.CancelledError
 
     def gauges(self) -> dict[str, float]:

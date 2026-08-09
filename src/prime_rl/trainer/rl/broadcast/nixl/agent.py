@@ -5,25 +5,49 @@ from __future__ import annotations
 import os
 import socket
 import time
+from importlib import import_module
 from typing import Any, Callable, Sequence
 
-from torch import Tensor
+from torch import Tensor, version
 
 MemDesc = tuple[int, int, int]
 
 
+def _nixl_api_modules() -> tuple[str, ...]:
+    cuda_major = version.cuda.split(".", 1)[0] if version.cuda else None
+    cuda_modules = ("nixl_cu13._api", "nixl_cu12._api")
+    if cuda_major == "12":
+        cuda_modules = tuple(reversed(cuda_modules))
+    return (*cuda_modules, "nixl._api")
+
+
+def _create_ucx_agent(name: str) -> Any:
+    unavailable: list[str] = []
+    for module_name in _nixl_api_modules():
+        try:
+            api = import_module(module_name)
+        except ImportError:
+            unavailable.append(f"{module_name} not installed")
+            continue
+        agent = api.nixl_agent(name, api.nixl_agent_config(backends=["UCX"]))
+        if "UCX" in agent.get_plugin_list():
+            return agent
+        unavailable.append(f"{module_name} has no UCX plugin")
+        del agent
+    raise RuntimeError(f"NIXL UCX backend is unavailable ({'; '.join(unavailable)})")
+
+
 class NixlAgent:
     def __init__(self, name: str) -> None:
-        try:
-            from nixl_cu13._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
-        except ImportError:
-            from nixl._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
-
         self.name = name
-        self._agent = nixl_agent(name, nixl_agent_config(backends=["UCX"]))
+        set_ucx_env_defaults()
+        self._agent = _create_ucx_agent(name)
 
-    def register_tensor(self, tensor: Tensor) -> None:
-        self._agent.register_memory(tensor, backends=["UCX"])
+    def register_tensor(self, tensor: Tensor) -> Any:
+        return self._agent.register_memory(tensor, backends=["UCX"])
+
+    def deregister_tensor(self, registration: Any) -> None:
+        self._agent.deregister_memory(registration, backends=["UCX"])
 
     def get_metadata(self) -> bytes:
         return self._agent.get_agent_metadata()
@@ -86,7 +110,7 @@ def make_agent_name(role: str, global_rank: int) -> str:
 
 
 def set_ucx_env_defaults() -> None:
-    os.environ.setdefault("UCX_TLS", "rc_x,rc,dc_x,dc,cuda_copy")
+    os.environ.setdefault("UCX_TLS", "all")
     os.environ.setdefault("UCX_IB_GPU_DIRECT_RDMA", "y")
     os.environ.setdefault("UCX_RNDV_SCHEME", "get_zcopy")
     os.environ.setdefault("UCX_RNDV_THRESH", "0")

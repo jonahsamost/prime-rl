@@ -169,7 +169,7 @@ def train(config: TrainerConfig):
     if config.max_concurrent_runs == 1:
         delta_mode = (
             config.weight_broadcast.delta_mode
-            if config.weight_broadcast.type == "nccl" and not config.data.fake
+            if config.weight_broadcast.type in ("nccl", "nixl") and not config.data.fake
             else "none"
         )
         optimizer = setup_optimizer(
@@ -180,10 +180,12 @@ def train(config: TrainerConfig):
             cpu_offload=config.model.optim_cpu_offload,
             delta_mode=delta_mode,
             delta_adam_bucket_mb=(
-                config.weight_broadcast.delta_adam_bucket_mb if config.weight_broadcast.type == "nccl" else 256
+                config.weight_broadcast.delta_adam_bucket_mb
+                if config.weight_broadcast.type in ("nccl", "nixl")
+                else 256
             ),
             delta_pipeline_depth=(
-                config.weight_broadcast.delta_pipeline_depth if config.weight_broadcast.type == "nccl" else 2
+                config.weight_broadcast.delta_pipeline_depth if config.weight_broadcast.type in ("nccl", "nixl") else 2
             ),
         )
         scheduler = setup_scheduler(optimizer, config.scheduler, config.max_steps, config.optim.lr)
@@ -219,7 +221,7 @@ def train(config: TrainerConfig):
     delta_optimizer = (
         optimizer
         if weight_broadcast is not None
-        and config.weight_broadcast.type == "nccl"
+        and config.weight_broadcast.type in ("nccl", "nixl")
         and config.weight_broadcast.delta_mode == "xor"
         else None
     )
@@ -641,7 +643,6 @@ def train(config: TrainerConfig):
                 if isinstance(weight_broadcast, NCCLWeightBroadcast):
                     weight_broadcast.nccl_broadcast_sender.set_optimizer_start_ns(optimizer_start_ns)
                 if delta_update is not None:
-                    assert isinstance(weight_broadcast, NCCLWeightBroadcast)
                     weight_broadcast.broadcast_weights(model, step=progress.step, delta_update=delta_update)
                     delta_update = None
                 else:

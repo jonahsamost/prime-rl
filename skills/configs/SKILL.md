@@ -98,8 +98,8 @@ Leave it unset for normal training. When enabled, it exports every sequence from
 
 ## Experimental XOR weight transfer
 
-The NCCL broadcaster has an opt-in GPU-resident nvCOMP LZ4 path for exact
-bitwise XOR updates in BF16, FP16, or FP32:
+The NCCL and NIXL broadcasters have an opt-in GPU-resident nvCOMP LZ4 path for
+exact bitwise XOR updates in BF16, FP16, or FP32:
 
 ```toml
 [model]
@@ -112,31 +112,71 @@ optimization_dtype = "bfloat16"
 dtype = "bfloat16"
 
 [weight_broadcast]
-type = "nccl"
+type = "nixl"
 delta_mode = "xor"
 delta_adam_bucket_mb = 256
 delta_pipeline_depth = 2
 ```
 
-Use `configs/debug/weight-sync/qwen3-32b-fsdp6-tp2-delta-smoke.toml` for the
-end-to-end Qwen3-32B smoke run.
+Use `configs/debug/weight-sync/qwen3-8b-fsdp4-tp2-nixl-xor-smoke.toml` for a
+dense NIXL smoke run and
+`configs/debug/weight-sync/mini-glm-moe-fsdp4-ep4-tp2-nixl-xor-smoke.toml` for
+the first MoE/EP smoke run.
+Run the dense smoke for at least four steps both as configured and with
+`--weight-broadcast.delta-mode none`. The full-transfer baseline exercises the
+same rendezvous with less producer work between updates, making it the more
+sensitive check for consecutive-update handshake races.
 
-This mode currently requires a text-only dense model with conventional
-Hugging Face layer names, AdamW, single-run training, `dp_replicate=1`, `cp=1`,
-`ep=1`, a single-node deployment, and no trainer, inference, or transfer
-quantization. Trainer `optimization_dtype` and inference `model.dtype` must be
-the same explicit value: `bfloat16`, `float16`, or `float32`. Model loaders must
-route weights through same-dtype, bit-preserving operations. Fake-data runs
-skip weight transfer and use standard AdamW even when delta mode is configured.
+This mode requires a text-only model, AdamW, single-run training,
+`dp_replicate=1`, `cp=1`, and no trainer, inference, or transfer quantization.
+Trainer `optimization_dtype` and inference `model.dtype` must be the same
+explicit value: `bfloat16`, `float16`, or `float32`. Model loaders must route
+weights through same-dtype, bit-preserving operations; the NIXL worker validates
+the traced load graph before the first update. NIXL supports rank-aware TP/EP
+pulls and multi-node deployment. NCCL XOR remains limited to `ep=1`,
+single-node runs. Fake-data runs skip weight transfer and use standard AdamW
+even when delta mode is configured.
 The startup update is a normal full checkpoint transfer;
 later consecutive versions are source-layout XOR updates. AdamW snapshots and
 updates bounded local parameter buckets, invokes one foreach-capable AdamW update per
 bucket, and batch-compresses that bucket's parameter XOR tensors with nvCOMP LZ4
 without leaving CUDA memory. The compressed tensor streams are packed into one
-CUDA `uint8` payload per trainer rank. Rank zero gathers compressed payloads and
-broadcasts them directly with NCCL. Each inference TP rank reconstructs and
-applies one source layer at a time. Runtime logs report the raw/compressed byte
-ratio and optimizer-start-to-inference-apply latency.
+CUDA `uint8` payload per trainer rank. NCCL gathers these payloads for collective
+broadcast. NIXL copies frames into reusable registered arenas on their owning
+trainer ranks; rank zero publishes metadata only, and each inference worker
+pulls only frames required by its traced TP/EP routes. Receivers decode and
+apply one transfer group at a time.
+
+For a single-node deployment with a loopback `weight_broadcast.host`, the `rl`
+launcher starts an in-memory ModelExpress-compatible metadata server and owns
+its lifecycle. Its log is `logs/model_express.log`. Multi-node deployments and
+non-loopback hosts require an externally deployed ModelExpress metadata server.
+Use `127.0.0.1`, rather than an IPv6 wildcard or `localhost`, for single-node
+smoke configs because GPU containers may have IPv6 disabled. Use a dedicated
+high coordinator port such as `18001`; port `8001` is the ModelExpress default
+and may already be occupied by a service supplied by the runtime image.
+
+Before a long NIXL smoke run, verify that one installed CUDA-specific binding
+actually exposes the UCX plugin:
+
+```bash
+uv sync --all-packages --extra disagg --extra flash-attn
+uv run python -c 'from prime_rl.trainer.rl.broadcast.nixl.agent import NixlAgent; NixlAgent("nixl-ucx-probe"); print("NIXL UCX ready")'
+```
+
+Importing a `nixl_cu12` or `nixl_cu13` Python module is not sufficient: wheels
+can be present without a usable UCX plugin. The adapter probes the binding that
+matches PyTorch's CUDA major first, then the other CUDA binding and the generic
+NIXL module, and selects the first one that actually advertises UCX. The
+`nixl-cu12==0.10.1` x86 wheel must come from PyPI; the smaller wheel formerly
+hosted on the prime-rl v0.5.0 release is missing a usable packaged UCX backend.
+If the probe fails after switching wheel sources, force replacement of the
+same-version installed wheel with `uv sync --refresh-package nixl-cu12`.
+NIXL defaults `UCX_TLS` to `all`; keep that value in single-node smoke configs
+so CUDA IPC/shared-memory or TCP transports remain available on hosts without
+RDMA devices. An error listing unavailable `rc_x`, `rc`, `dc_x`, and `dc`
+followed by `no active messages transport` means a restrictive inherited
+`UCX_TLS` excluded those fallback transports.
 
 ## Key files
 

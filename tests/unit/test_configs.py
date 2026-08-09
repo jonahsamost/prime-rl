@@ -540,13 +540,14 @@ def test_shared_and_subconfig_disjoint_fields_coexist():
     assert config.trainer.model.impl == "custom"
 
 
+@pytest.mark.parametrize("transport", ["nccl", "nixl"])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
-def test_xor_weight_transfer_propagates_to_nccl_components(dtype):
+def test_xor_weight_transfer_propagates_to_in_memory_components(transport, dtype):
     config = RLConfig.model_validate(
         {
             "model": {"name": "Qwen/Qwen3-0.6B-Base"},
             "weight_broadcast": {
-                "type": "nccl",
+                "type": transport,
                 "delta_mode": "xor",
                 "delta_adam_bucket_mb": 192,
                 "delta_pipeline_depth": 3,
@@ -557,11 +558,11 @@ def test_xor_weight_transfer_propagates_to_nccl_components(dtype):
         }
     )
 
-    assert config.trainer.weight_broadcast.type == "nccl"
+    assert config.trainer.weight_broadcast.type == transport
     assert config.trainer.weight_broadcast.delta_mode == "xor"
     assert config.trainer.weight_broadcast.delta_adam_bucket_mb == 192
     assert config.trainer.weight_broadcast.delta_pipeline_depth == 3
-    assert config.orchestrator.weight_broadcast.type == "nccl"
+    assert config.orchestrator.weight_broadcast.type == transport
     assert config.orchestrator.weight_broadcast.delta_mode == "xor"
     assert config.orchestrator.weight_broadcast.delta_adam_bucket_mb == 192
     assert config.orchestrator.weight_broadcast.delta_pipeline_depth == 3

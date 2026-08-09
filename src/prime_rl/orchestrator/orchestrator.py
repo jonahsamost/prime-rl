@@ -328,6 +328,7 @@ class Orchestrator:
                 config.weight_broadcast.timeout,
                 config.weight_broadcast.inference_world_size,
                 config.weight_broadcast.session_id,
+                config.weight_broadcast.delta_mode,
             )
             self.model_express = ModelExpressSession(
                 client=MxClient(server_url=f"{config.weight_broadcast.host}:{config.weight_broadcast.port}"),
@@ -371,8 +372,8 @@ class Orchestrator:
                 await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_READY)
             await self.policy_inference.update_weights(weights_path, lora_name=self.lora_name, step=sync_version)
             if self.model_express is not None:
-                await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_INITIALIZING)
-                # Complete the startup rendezvous before the watcher begins its next cycle.
+                # Observe the trainer reset before acknowledging it. The trainer
+                # holds this state, so the startup rendezvous has no transient edge.
                 await asyncio.to_thread(
                     self.model_express.wait_for,
                     "trainer",
@@ -380,6 +381,7 @@ class Orchestrator:
                     status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
                     timeout=config.weight_broadcast.timeout,
                 )
+                await asyncio.to_thread(self.model_express.set_status, p2p_pb2.SOURCE_STATUS_INITIALIZING)
             if self.lora_name is not None:
                 self.policy_inference.update_model_name(self.lora_name)
                 self.policy.model_name = self.lora_name

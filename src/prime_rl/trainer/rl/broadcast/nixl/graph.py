@@ -50,9 +50,10 @@ SUPPORTED_OPS: dict[Any, str] = {
     torch.Tensor.unbind: "unbind",
     torch.Tensor.to: "to",
     torch.Tensor.float: "float",
+    torch.Tensor.half: "half",
     torch.Tensor.bfloat16: "bfloat16",
 }
-_SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
+_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
 class UnsupportedOpError(NotImplementedError):
@@ -73,6 +74,17 @@ def apply_chain(value: Any, ops: OperationChain) -> torch.Tensor:
         else:
             result = getattr(result, operation.name)(*operation.args, **operation.kwargs)
     return result
+
+
+def chain_preserves_dtype(shape: tuple[int, ...], dtype: torch.dtype, ops: OperationChain) -> bool:
+    """Whether every intermediate tensor keeps the source representation."""
+    root = torch.empty(shape, dtype=dtype, device="meta")
+    for end in range(1, len(ops) + 1):
+        value = apply_chain(root, ops[:end])
+        tensors = value if isinstance(value, (tuple, list)) else (value,)
+        if any(not isinstance(tensor, torch.Tensor) or tensor.dtype != dtype for tensor in tensors):
+            return False
+    return True
 
 
 def is_view_of(value: torch.Tensor, root: torch.Tensor) -> bool:
@@ -227,7 +239,7 @@ class LazyWeight(torch.Tensor):
             )
         if self.dtype not in _SUPPORTED_DTYPES or destination.dtype not in _SUPPORTED_DTYPES:
             raise UnsupportedOpError(
-                f"NIXL lazy copies only support BF16/FP32 values, got "
+                f"NIXL lazy copies only support BF16/FP16/FP32 values, got "
                 f"source={self.dtype}, destination={destination.dtype} for {self._source_name!r}"
             )
 
@@ -282,7 +294,7 @@ class LazyWeight(torch.Tensor):
         if isinstance(result, torch.Tensor):
             if result.dtype not in _SUPPORTED_DTYPES:
                 raise UnsupportedOpError(
-                    f"NIXL lazy replay only supports BF16/FP32 values, got {result.dtype} "
+                    f"NIXL lazy replay only supports BF16/FP16/FP32 values, got {result.dtype} "
                     f"after {op_name!r} on {source._source_name!r}"
                 )
             return source._child(operation)

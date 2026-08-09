@@ -1,8 +1,7 @@
-"""Serve FP32 FSDP master shards through reusable typed NIXL arenas."""
+"""Serve FSDP weight shards through reusable typed NIXL arenas."""
 
 from __future__ import annotations
 
-import re
 import time
 from collections import defaultdict
 from collections.abc import Callable
@@ -28,6 +27,16 @@ from prime_rl.trainer.rl.broadcast.nixl.cuda_malloc_memory import (
     size_cuda_buffers,
     use_cuda_malloc_pool,
 )
+from prime_rl.trainer.rl.broadcast.nixl.delta_manifest import (
+    NIXL_DELTA_PROTOCOL_VERSION,
+    NIXLDeltaAgent,
+    NIXLDeltaFrame,
+    NIXLDeltaGroup,
+    NIXLDeltaManifest,
+    NIXLPolicyMetadata,
+    build_local_delta_groups,
+    merge_delta_manifest_fragments,
+)
 from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
 from prime_rl.trainer.rl.broadcast.nixl.trainer_tensor_table import (
     TrainerAgent,
@@ -38,8 +47,9 @@ from prime_rl.trainer.rl.broadcast.nixl.trainer_tensor_table import (
 )
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.utils import get_world
+from prime_rl.weight_sync.grouping import LAYER_RE
+from prime_rl.weight_sync.xor_delta import DeltaUpdate
 
-LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?=\.|$)")
 BUFFER_POLL_INTERVAL = 0.01
 MAX_STAGING_BUFFER_COUNT = 8
 
@@ -69,7 +79,12 @@ class TransferGroupIndex:
 
 
 class NIXLWeightBroadcast(WeightBroadcast):
-    def __init__(self, output_dir: Path, config: NIXLWeightBroadcastConfig, parallel_dims: ParallelDims) -> None:
+    def __init__(
+        self,
+        output_dir: Path,
+        config: NIXLWeightBroadcastConfig,
+        parallel_dims: ParallelDims,
+    ) -> None:
         super().__init__(output_dir)
         self.config = config
         self.parallel_dims = parallel_dims
@@ -83,7 +98,13 @@ class NIXLWeightBroadcast(WeightBroadcast):
         self.staged_shards: list[StagedTensorShard] = []
         self.staged_shards_by_group: dict[int, list[StagedTensorShard]] = {}
         self.staging_arenas: dict[torch.dtype, torch.Tensor] = {}
+        self.staging_registrations: list[object] = []
+        self.delta_staging_arena: torch.Tensor | None = None
+        self.delta_staging_registration: object | None = None
+        self.delta_staging_slot_bytes = 0
+        self.delta_group_copies: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
         self.staging_buffer_count: int
+        self.trainer_table: TrainerTensorTable | None = None
 
     @property
     def is_serving_rank(self) -> bool:
@@ -123,7 +144,13 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 continue
             full_shape = tuple(value.shape)
             group_index = self.find_transfer_group_index(name, transfer_groups)
-            wire_dtype = torch.float32 if keep_in_fp32(name) else torch.bfloat16
+            wire_dtype = (
+                value.dtype
+                if self.config.delta_mode == "xor"
+                else torch.float32
+                if keep_in_fp32(name)
+                else torch.bfloat16
+            )
 
             # Unsharded tensors are identical on every rank, so rank 0 serves the only copy.
             if not isinstance(value, DTensor):
@@ -236,10 +263,11 @@ class NIXLWeightBroadcast(WeightBroadcast):
             group_offsets[shard.group_index] += shard.source_tensor.numel()
 
         for arena in self.staging_arenas.values():
-            self.nixl_agent.register_tensor(arena)
+            self.staging_registrations.append(self.nixl_agent.register_tensor(arena))
 
     def prepare_staging_buffers(self) -> None:
-        group_elements = {dtype: [0] * len(self.transfer_group_names) for dtype in (torch.bfloat16, torch.float32)}
+        wire_dtypes = {shard.wire_dtype for shard in self.staged_shards}
+        group_elements = {dtype: [0] * len(self.transfer_group_names) for dtype in wire_dtypes}
         for shard in self.staged_shards:
             group_elements[shard.wire_dtype][shard.group_index] += shard.source_tensor.numel()
         largest_group_elements = {dtype: max(elements, default=0) for dtype, elements in group_elements.items()}
@@ -356,6 +384,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
 
         if table_fragments is not None:
             table = self.merge_trainer_table_fragments(table_fragments)
+            self.trainer_table = table
             server_url = f"{self.config.host}:{self.config.port}"
             client = MxClient(server_url=server_url)
             self.buffer_sessions = []
@@ -379,6 +408,15 @@ class NIXLWeightBroadcast(WeightBroadcast):
             )
             self.model_express.publish(nixl_metadata=table.encode())
             self.model_express.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+            self.update_session = ModelExpressSession(
+                client=client,
+                role="trainer",
+                rank=0,
+                session_id=f"{self.config.session_id}:updates",
+                worker_id="trainer-update",
+            )
+            self.update_session.publish(nixl_metadata=NIXLPolicyMetadata(kind="full", payload=table.encode()).encode())
+            self.update_session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
             tensor_count = sum(len(group.tensors) for group in table.groups)
             self.logger.info(
                 f"Published {tensor_count} trainer tensors in {len(table.groups)} groups "
@@ -406,10 +444,49 @@ class NIXLWeightBroadcast(WeightBroadcast):
             )
         dist.barrier()
 
+    def finish_policy_transfer(self) -> None:
+        if self.world.is_master:
+            self.model_express.wait_for(
+                "inference",
+                count=self.config.inference_world_size,
+                status=p2p_pb2.SOURCE_STATUS_READY,
+                timeout=self.config.timeout,
+            )
+            # Keep INITIALIZING visible until the orchestrator completes this cycle.
+            # Otherwise a fast next step can publish READY before its polling watcher
+            # observes the reset, leaving both sides waiting on different versions.
+            self.model_express.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+            self.update_session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+            self.model_express.wait_for(
+                "orchestrator",
+                count=1,
+                status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+                timeout=self.config.timeout,
+            )
+        dist.barrier()
+
     @torch.no_grad()
-    def broadcast_weights(self, model: nn.Module, step: int) -> None:
+    def broadcast_weights(
+        self,
+        model: nn.Module,
+        step: int,
+        delta_update: DeltaUpdate | None = None,
+    ) -> None:
         ready_runs = list(self.multi_run_manager.ready_to_update_idxs)
         self.initialize_transfer(model)
+        if delta_update is not None:
+            self.broadcast_delta(delta_update, step, ready_runs)
+            return
+        if self.world.is_master:
+            assert self.trainer_table is not None
+            self.update_session.publish(
+                nixl_metadata=NIXLPolicyMetadata(
+                    kind="full",
+                    payload=self.trainer_table.encode(),
+                    step=step,
+                ).encode()
+            )
+            self.update_session.set_status(p2p_pb2.SOURCE_STATUS_READY)
         start = time.perf_counter()
 
         if self.world.is_master:
@@ -450,21 +527,148 @@ class NIXLWeightBroadcast(WeightBroadcast):
             buffer_index = group % self.staging_buffer_count
             self.finish_staging_buffer_transfer(buffer_index)
 
+        self.finish_policy_transfer()
+        for run_index in ready_runs:
+            self.multi_run_manager.ready_to_update[run_index] = False
+        self.logger.info(f"NIXL+ModelExpress policy v{step} synchronized in {time.perf_counter() - start:.2f}s")
+
+    def build_local_delta_manifest(self, update: DeltaUpdate) -> NIXLDeltaManifest:
+        groups = build_local_delta_groups(update, self.transfer_group_names)
+        frame_payloads = {payload.data_ptr(): payload for payload in update.frame_payloads()}
+        group_sizes = [sum((frame.compressed_nbytes + 255) // 256 * 256 for frame in frames) for frames in groups]
+        required_slot_bytes = max(group_sizes, default=0)
+        self.ensure_delta_staging_arena(required_slot_bytes)
+        assert self.delta_staging_arena is not None
+
+        staged_groups: list[list[NIXLDeltaFrame]] = []
+        self.delta_group_copies = []
+        for group_index, frames in enumerate(groups):
+            slot_offset = (group_index % self.staging_buffer_count) * self.delta_staging_slot_bytes
+            offset = 0
+            staged_frames: list[NIXLDeltaFrame] = []
+            copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for frame in frames:
+                offset = (offset + 255) // 256 * 256
+                destination = self.delta_staging_arena.narrow(
+                    0,
+                    slot_offset + offset,
+                    frame.compressed_nbytes,
+                )
+                staged_frames.append(
+                    NIXLDeltaFrame(
+                        agent=frame.agent,
+                        addr=destination.data_ptr(),
+                        compressed_nbytes=frame.compressed_nbytes,
+                        uncompressed_nbytes=frame.uncompressed_nbytes,
+                        tensors=frame.tensors,
+                    )
+                )
+                copies.append((destination, frame_payloads[frame.addr]))
+                offset += frame.compressed_nbytes
+            staged_groups.append(staged_frames)
+            self.delta_group_copies.append(copies)
+        return NIXLDeltaManifest(
+            protocol_version=NIXL_DELTA_PROTOCOL_VERSION,
+            base_step=update.base_step,
+            step=update.step,
+            agents=(
+                NIXLDeltaAgent(
+                    name=self.nixl_agent.name,
+                    metadata=self.nixl_agent.get_metadata(),
+                    device_id=torch.cuda.current_device(),
+                ),
+            ),
+            groups=tuple(
+                NIXLDeltaGroup(name=name, frames=tuple(frames))
+                for name, frames in zip(self.transfer_group_names, staged_groups, strict=True)
+            ),
+        )
+
+    def ensure_delta_staging_arena(self, slot_bytes: int) -> None:
+        slot_bytes = max(256, (slot_bytes + 255) // 256 * 256)
+        if self.delta_staging_arena is not None and slot_bytes <= self.delta_staging_slot_bytes:
+            return
+        if self.delta_staging_registration is not None:
+            self.nixl_agent.deregister_tensor(self.delta_staging_registration)
+        self.delta_staging_slot_bytes = slot_bytes
+        with use_cuda_malloc_pool():
+            self.delta_staging_arena = torch.empty(
+                self.staging_buffer_count * slot_bytes,
+                dtype=torch.uint8,
+                device=torch.cuda.current_device(),
+            )
+        self.delta_staging_registration = self.nixl_agent.register_tensor(self.delta_staging_arena)
+
+    def gather_delta_manifest(self, update: DeltaUpdate) -> NIXLDeltaManifest | None:
+        fragment = self.build_local_delta_manifest(update).encode() if self.is_serving_rank else None
+        gathered: list[bytes | None] | None = [None] * self.world.world_size if self.world.is_master else None
+        dist.gather_object(fragment, gathered, dst=0)
+        if gathered is None:
+            return None
+        return merge_delta_manifest_fragments(
+            [NIXLDeltaManifest.decode(value) for value in gathered if value is not None]
+        )
+
+    @torch.no_grad()
+    def broadcast_delta(self, update: DeltaUpdate, step: int, ready_runs: list[int]) -> None:
+        if self.config.delta_mode != "xor":
+            raise ValueError("received an XOR update while NIXL delta mode is disabled")
+        if update.step != step:
+            raise ValueError(f"delta step {update.step} does not match broadcast step {step}")
+        start = time.perf_counter()
+        manifest = self.gather_delta_manifest(update)
+        if manifest is not None:
+            compressed_nbytes = sum(frame.compressed_nbytes for group in manifest.groups for frame in group.frames)
+            uncompressed_nbytes = sum(frame.uncompressed_nbytes for group in manifest.groups for frame in group.frames)
+            self.update_session.publish(
+                nixl_metadata=NIXLPolicyMetadata(
+                    kind="xor",
+                    payload=manifest.encode(),
+                    base_step=manifest.base_step,
+                    step=manifest.step,
+                ).encode()
+            )
+            self.update_session.set_status(p2p_pb2.SOURCE_STATUS_READY)
+            self.logger.info(
+                f"NIXL XOR policy v{step}: {uncompressed_nbytes / compressed_nbytes:.2f}x compression "
+                f"({uncompressed_nbytes / 2**30:.2f} GiB raw, "
+                f"{compressed_nbytes / 2**30:.2f} GiB compressed)"
+            )
+
         if self.world.is_master:
+            self.model_express.set_status(p2p_pb2.SOURCE_STATUS_READY)
             self.model_express.wait_for(
-                "inference",
-                count=self.config.inference_world_size,
+                "orchestrator",
+                count=1,
                 status=p2p_pb2.SOURCE_STATUS_READY,
                 timeout=self.config.timeout,
             )
             self.model_express.wait_for(
-                "orchestrator",
-                count=1,
+                "inference",
+                count=self.config.inference_world_size,
                 status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
                 timeout=self.config.timeout,
             )
-            self.model_express.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
-        dist.barrier()
+
+        for group_index, group_name in enumerate(self.transfer_group_names):
+            buffer_index = group_index % self.staging_buffer_count
+            if group_index >= self.staging_buffer_count:
+                self.finish_staging_buffer_transfer(buffer_index)
+            if self.is_serving_rank:
+                for destination, source in self.delta_group_copies[group_index]:
+                    destination.copy_(source)
+                torch.cuda.synchronize()
+            dist.barrier()
+            if self.world.is_master:
+                self.buffer_sessions[buffer_index].set_status(p2p_pb2.SOURCE_STATUS_READY)
+                self.logger.debug(f"NIXL XOR policy v{step} group {group_name} ready in buffer {buffer_index}")
+
+        first_pending_group = max(0, len(self.transfer_group_names) - self.staging_buffer_count)
+        for group_index in range(first_pending_group, len(self.transfer_group_names)):
+            self.finish_staging_buffer_transfer(group_index % self.staging_buffer_count)
+
+        self.finish_policy_transfer()
+
         for run_index in ready_runs:
             self.multi_run_manager.ready_to_update[run_index] = False
-        self.logger.info(f"NIXL+ModelExpress policy v{step} synchronized in {time.perf_counter() - start:.2f}s")
+        self.logger.info(f"NIXL XOR policy v{step} synchronized in {time.perf_counter() - start:.2f}s")

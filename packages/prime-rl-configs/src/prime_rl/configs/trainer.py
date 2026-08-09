@@ -571,6 +571,15 @@ class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     session_id: str = "default"
     """ModelExpress session ID."""
 
+    delta_mode: Literal["none", "xor"] = "none"
+    """Use exact GPU nvCOMP LZ4 XOR updates after the initial full transfer."""
+
+    delta_adam_bucket_mb: int = Field(256, ge=1)
+    """Maximum local parameter MiB updated by each batched delta-aware AdamW call."""
+
+    delta_pipeline_depth: int = Field(2, ge=1)
+    """Maximum number of nvCOMP encode batches in flight."""
+
 
 WeightBroadcastConfig: TypeAlias = Annotated[
     FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig | NIXLWeightBroadcastConfig,

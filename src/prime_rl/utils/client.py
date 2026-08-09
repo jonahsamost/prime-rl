@@ -580,6 +580,7 @@ async def init_nixl_broadcast(
     timeout: int,
     inference_world_size: int,
     session_id: str,
+    delta_mode: str = "none",
 ) -> None:
     """Configure every vLLM worker for NIXL + ModelExpress pulls."""
     workers_per_server = inference_world_size // len(admin_clients)
@@ -597,6 +598,7 @@ async def init_nixl_broadcast(
                 "timeout": timeout,
                 "quantize_in_weight_transfer": False,
                 "session_id": session_id,
+                "delta_mode": delta_mode,
             },
         )
 

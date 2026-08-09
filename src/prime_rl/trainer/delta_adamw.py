@@ -10,6 +10,7 @@ from torch.optim import AdamW
 from torch.optim.adam import adam
 from torch.optim.optimizer import _use_grad_for_differentiable
 
+from prime_rl.weight_sync.grouping import weight_transfer_group_name
 from prime_rl.weight_sync.xor_delta import (
     SUPPORTED_DELTA_DTYPES,
     DeltaEncoder,
@@ -118,6 +119,7 @@ class DeltaAdamW(AdamW):
                 for bucket_start, bucket_end, _bucket_bytes in _parameter_buckets(
                     params_with_grad,
                     self._delta_adam_bucket_bytes,
+                    self._parameter_names,
                 ):
                     bucket_parameters = params_with_grad[bucket_start:bucket_end]
                     local_parameters: list[Tensor] = []
@@ -201,19 +203,27 @@ class DeltaAdamW(AdamW):
 def _parameter_buckets(
     parameters: list[Tensor],
     bucket_bytes: int,
+    parameter_names: dict[int, str] | None = None,
 ) -> Iterator[tuple[int, int, int]]:
-    """Yield contiguous parameter ranges capped by local parameter bytes."""
+    """Yield dtype- and transfer-group-homogeneous parameter ranges."""
     start = 0
     used = 0
     dtype: torch.dtype | None = None
+    transfer_group: str | None = None
     for index, parameter in enumerate(parameters):
         value = local_tensor(parameter)
         parameter_bytes = value.numel() * value.element_size()
-        if used and (value.dtype != dtype or used + parameter_bytes > bucket_bytes):
+        parameter_group = (
+            weight_transfer_group_name(parameter_names[id(parameter)]) if parameter_names is not None else None
+        )
+        if used and (
+            value.dtype != dtype or parameter_group != transfer_group or used + parameter_bytes > bucket_bytes
+        ):
             yield start, index, used
             start = index
             used = 0
         dtype = value.dtype
+        transfer_group = parameter_group
         used += parameter_bytes
     if start < len(parameters):
         yield start, len(parameters), used
@@ -226,25 +236,26 @@ def _parameter_shard_descriptor(parameter: Tensor) -> tuple[tuple[int, ...], int
     shard_mesh_dims = [index for index, placement in enumerate(parameter.placements) if isinstance(placement, Shard)]
     if not shard_mesh_dims:
         return tuple(parameter.shape), None, 0, 1
-    if len(shard_mesh_dims) != 1:
-        raise ValueError(f"XOR delta FSDP mode requires exactly one sharded mesh dimension, got {parameter.placements}")
     if any(
         isinstance(placement, Replicate) and parameter.device_mesh.size(index) > 1
         for index, placement in enumerate(parameter.placements)
     ):
         raise ValueError("XOR delta FSDP mode does not yet support replicated HSDP mesh dimensions")
-    shard_mesh_dim = shard_mesh_dims[0]
-    placement = parameter.placements[shard_mesh_dim]
-    assert isinstance(placement, Shard)
-    if placement.dim != 0:
-        raise ValueError(f"XOR delta FSDP mode supports Shard(0), got {placement}")
-    shard_count = parameter.device_mesh.size(shard_mesh_dim)
+    placements = [parameter.placements[index] for index in shard_mesh_dims]
+    if any(not isinstance(placement, Shard) or placement.dim != 0 for placement in placements):
+        raise ValueError(f"XOR delta FSDP mode supports only Shard(0), got {parameter.placements}")
+    shard_index = 0
+    shard_count = 1
+    for mesh_dim in shard_mesh_dims:
+        dimension_size = parameter.device_mesh.size(mesh_dim)
+        shard_index = shard_index * dimension_size + parameter.device_mesh.get_local_rank(mesh_dim)
+        shard_count *= dimension_size
     if shard_count == 1:
         return tuple(parameter.shape), None, 0, 1
     return (
         tuple(parameter.shape),
         0,
-        parameter.device_mesh.get_local_rank(shard_mesh_dim),
+        shard_index,
         shard_count,
     )
 

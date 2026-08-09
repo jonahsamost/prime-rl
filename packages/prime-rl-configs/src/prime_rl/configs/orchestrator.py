@@ -449,6 +449,15 @@ class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     session_id: str = "default"
     """ModelExpress session ID."""
 
+    delta_mode: Literal["none", "xor"] = "none"
+    """Use exact GPU nvCOMP LZ4 XOR updates after the initial full transfer."""
+
+    delta_adam_bucket_mb: int = Field(256, ge=1)
+    """Trainer-side delta-aware AdamW bucket size, propagated from the shared config."""
+
+    delta_pipeline_depth: int = Field(2, ge=1)
+    """Trainer-side nvCOMP pipeline depth, propagated from the shared config."""
+
 
 WeightBroadcastConfig: TypeAlias = Annotated[
     FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig | NIXLWeightBroadcastConfig,
