@@ -1,11 +1,11 @@
-max_steps = 6
+max_steps = 26
 seq_len = 256
 
 [env_vars]
 UCX_TLS = "all"
 
 [model]
-name = "samsja/mini-glm-moe"
+name = "Qwen/Qwen3-14B-Base"
 
 [trainer.model]
 impl = "custom"
@@ -14,13 +14,9 @@ compile = "None"
 optim_cpu_offload = false
 dp_replicate = 1
 cp = 1
-ep = 4
-
-[trainer.model.debug]
-force_balanced_routing = true
+ep = 1
 
 [trainer.optim]
-type = "adamw"
 lr = 3e-6
 
 [orchestrator]
@@ -32,7 +28,7 @@ type = "zero_advantage"
 enforce = false
 
 [orchestrator.renderer]
-name = "default"
+name = "qwen3"
 
 [orchestrator.train.sampling]
 max_completion_tokens = 64
@@ -50,7 +46,6 @@ id = "null"
 type = "subprocess"
 
 [inference]
-enable_expert_parallel = true
 gpu_memory_utilization = 0.5
 
 [inference.model]

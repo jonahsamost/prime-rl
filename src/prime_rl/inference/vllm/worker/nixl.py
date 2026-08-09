@@ -41,7 +41,7 @@ from prime_rl.trainer.rl.broadcast.nixl.graph import (
     plan_tensor_replay,
 )
 from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
-from prime_rl.trainer.rl.broadcast.nixl.tensor_routing import route_sharded_tensor
+from prime_rl.trainer.rl.broadcast.nixl.tensor_routing import TensorRoute, route_sharded_tensor
 from prime_rl.trainer.rl.broadcast.nixl.trainer_tensor_table import TrainerTensor, TrainerTensorTable
 from prime_rl.weight_sync.xor_delta import (
     CompressedDeltaFrame,
@@ -67,6 +67,7 @@ class TensorCopyPlan:
     source_tensor: TrainerTensor
     source_plan: TensorReplayPlan
     replay_ops: OperationChain
+    routes: list[TensorRoute]
 
 
 @dataclass
@@ -85,6 +86,9 @@ class WeightTransferGroup:
     name: str
     layers: list[LayerWeightTransferPlan]
     pulls: list[tuple[Any, Any, list[int]]]
+    pull_nbytes: int
+    required_delta_sources: frozenset[tuple[int, str]]
+    required_delta_nbytes: int
 
 
 @dataclass
@@ -93,6 +97,51 @@ class WeightTransferPlan:
     receive_arenas: dict[torch.dtype, torch.Tensor]
     receive_buffer_count: int
     groups: list[WeightTransferGroup]
+
+
+@dataclass
+class DeltaGroupMetrics:
+    published_frames: int = 0
+    pulled_frames: int = 0
+    published_bytes: int = 0
+    pulled_bytes: int = 0
+    published_uncompressed_bytes: int = 0
+    pulled_uncompressed_bytes: int = 0
+    routed_bytes: int = 0
+    wait_seconds: float = 0.0
+    pull_seconds: float = 0.0
+    acknowledge_seconds: float = 0.0
+
+
+@dataclass
+class PreparedDeltaGroup:
+    transfer_group: WeightTransferGroup
+    decoded: dict[tuple[int, str], tuple[torch.Tensor, DeltaTensorMetadata]]
+    decode_started: torch.cuda.Event
+    decode_finished: torch.cuda.Event
+    metrics: DeltaGroupMetrics
+
+
+@dataclass
+class FullGroupMetrics:
+    wait_seconds: float = 0.0
+    pull_seconds: float = 0.0
+    acknowledge_seconds: float = 0.0
+
+
+def _covered_nbytes(ranges: list[tuple[int, int]]) -> int:
+    if not ranges:
+        return 0
+    ordered = sorted(ranges)
+    covered = 0
+    start, end = ordered[0]
+    for next_start, next_end in ordered[1:]:
+        if next_start > end:
+            covered += end - start
+            start, end = next_start, next_end
+        else:
+            end = max(end, next_end)
+    return covered + end - start
 
 
 class NIXLWeightUpdateWorker(Worker):
@@ -129,11 +178,14 @@ class NIXLWeightUpdateWorker(Worker):
         self.weight_transfer_timeout = timeout
         self.delta_mode = delta_mode
         self.current_step: int | None = None
+        self.full_sync_required = True
         self.delta_codec = NvcompLZ4Codec(self.device) if delta_mode == "xor" else None
         self.delta_peer_metadata: dict[str, bytes] = {}
         self.delta_peer_names: dict[str, str] = {}
-        self.delta_receive_arena: torch.Tensor | None = None
-        self.delta_receive_registration: Any | None = None
+        self.delta_receive_arenas: list[torch.Tensor] = []
+        self.delta_receive_registrations: list[Any] = []
+        self.delta_receive_slot_bytes = 0
+        self.delta_prefetch_stream = torch.cuda.Stream(device=self.device)
         self.receive_registrations: list[Any] = []
         self.weight_transfer_plan: WeightTransferPlan | None = None
         self.update_session = ModelExpressSession(
@@ -463,6 +515,7 @@ class NIXLWeightUpdateWorker(Worker):
                 dtype: (group_index % receive_buffer_count) * elements
                 for dtype, elements in receive_buffer_elements.items()
             }
+            delta_source_ranges: dict[tuple[int, str], list[tuple[int, int]]] = defaultdict(list)
 
             for copy in copies_by_group[group_index]:
                 replay_plan = replay_plans[id(copy)]
@@ -478,13 +531,18 @@ class NIXLWeightUpdateWorker(Worker):
                     source_tensor=source,
                     source_plan=replay_plan,
                     replay_ops=replay_plan.replay_ops,
+                    routes=[],
                 )
+                copy_plan.routes = route_sharded_tensor(replay_plan, source, staging_tensor)
                 plans = persistent_plans_by_layer if copy.is_persistent else copy_plans_by_layer
                 plans[id(copy.destination_module)].append(copy_plan)
 
-                for route in route_sharded_tensor(replay_plan, source, staging_tensor):
+                for route in copy_plan.routes:
                     local_descs[route.agent].append((route.destination_addr, route.nbytes, self.device.index))
                     remote_descs[route.agent].append((route.source_addr, route.nbytes, agent_devices[route.agent]))
+                    delta_source_ranges[(route.agent, copy.source_name)].append(
+                        (route.source_addr, route.source_addr + route.nbytes)
+                    )
 
             transfer_groups.append(
                 WeightTransferGroup(
@@ -500,6 +558,14 @@ class NIXLWeightUpdateWorker(Worker):
                         remote_descs,
                         peer_names,
                     ),
+                    pull_nbytes=sum(size for descs in local_descs.values() for _addr, size, _device in descs),
+                    required_delta_sources=frozenset(
+                        (route.agent, copy_plan.recorded_copy.source_name)
+                        for plans in (*copy_plans_by_layer.values(), *persistent_plans_by_layer.values())
+                        for copy_plan in plans
+                        for route in copy_plan.routes
+                    ),
+                    required_delta_nbytes=sum(_covered_nbytes(ranges) for ranges in delta_source_ranges.values()),
                 )
             )
         return transfer_groups
@@ -586,20 +652,27 @@ class NIXLWeightUpdateWorker(Worker):
             timeout=self.weight_transfer_timeout,
         )[0]
         policy = NIXLPolicyMetadata.decode(self.update_session.fetch(update_ref).nixl_metadata)
-        if policy.kind == "xor":
-            if self.delta_mode != "xor":
-                raise RuntimeError("trainer published a NIXL XOR update while delta mode is disabled")
-            if self.current_step != policy.base_step:
-                raise RuntimeError(
-                    f"cannot apply NIXL XOR delta {policy.base_step}->{policy.step}: "
-                    f"resident policy is {self.current_step}"
-                )
-            self.apply_delta_manifest(plan, NIXLDeltaManifest.decode(policy.payload))
-        else:
-            self.apply_transfer_plan(plan)
-        update_mla_absorbed_weights(self.raw_model)
-        torch.cuda.synchronize(self.device)
+        try:
+            if policy.kind == "xor":
+                if self.delta_mode != "xor":
+                    raise RuntimeError("trainer published a NIXL XOR update while delta mode is disabled")
+                if self.full_sync_required or self.current_step != policy.base_step:
+                    raise RuntimeError(
+                        f"cannot apply NIXL XOR delta {policy.base_step}->{policy.step}: "
+                        f"resident policy is {self.current_step}, full_sync_required={self.full_sync_required}"
+                    )
+                self.apply_delta_manifest(plan, NIXLDeltaManifest.decode(policy.payload))
+            else:
+                self.apply_transfer_plan(plan)
+            update_mla_absorbed_weights(self.raw_model)
+            torch.cuda.synchronize(self.device)
+        except BaseException:
+            self.current_step = None
+            self.full_sync_required = True
+            self.model_express.set_status(p2p_pb2.SOURCE_STATUS_STALE)
+            raise
         self.current_step = policy.step
+        self.full_sync_required = False
         self.model_express.set_status(p2p_pb2.SOURCE_STATUS_READY)
         logger.info(
             "Applied NIXL policy update on rank %d in %.2fs",
@@ -615,46 +688,174 @@ class NIXLWeightUpdateWorker(Worker):
         if tuple(group.name for group in manifest.groups) != tuple(group.name for group in plan.groups):
             raise RuntimeError("NIXL delta manifest groups do not match the full-transfer plan")
 
-        for group_index, (transfer_group, delta_group) in enumerate(zip(plan.groups, manifest.groups, strict=True)):
-            session = self.buffer_sessions[group_index % len(self.buffer_sessions)]
-            session.wait_for(
-                "trainer",
-                count=1,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-                timeout=self.weight_transfer_timeout,
-                poll_interval=_BUFFER_POLL_INTERVAL,
+        selected_by_group = [
+            self.select_delta_frames(transfer_group, delta_group.frames)
+            for transfer_group, delta_group in zip(plan.groups, manifest.groups, strict=True)
+        ]
+        receive_buffer_count = min(2, len(plan.groups))
+        slot_bytes = max((self.packed_delta_frame_bytes(frames) for frames in selected_by_group), default=0)
+        self.ensure_delta_receive_arenas(slot_bytes, receive_buffer_count)
+        slot_events: list[torch.cuda.Event | None] = [None] * receive_buffer_count
+        decode_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        apply_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        group_metrics: list[DeltaGroupMetrics] = []
+        current_stream = torch.cuda.current_stream(self.device)
+        pipeline_started = time.perf_counter()
+        cancelled = Event()
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nixl-delta-prefetch")
+        try:
+            future = executor.submit(
+                self.prepare_delta_group,
+                0,
+                plan.groups[0],
+                manifest.groups[0].frames,
+                selected_by_group[0],
+                manifest,
+                slot_events,
+                cancelled,
             )
-            pulled = self.pull_delta_group(transfer_group, delta_group.frames, manifest)
+            for group_index in range(len(plan.groups)):
+                prepared = future.result()
+                if group_index + 1 < len(plan.groups):
+                    future = executor.submit(
+                        self.prepare_delta_group,
+                        group_index + 1,
+                        plan.groups[group_index + 1],
+                        manifest.groups[group_index + 1].frames,
+                        selected_by_group[group_index + 1],
+                        manifest,
+                        slot_events,
+                        cancelled,
+                    )
+
+                current_stream.wait_event(prepared.decode_finished)
+                # Decode allocates on a side stream; keep its storage alive through asynchronous apply.
+                for value, _metadata in prepared.decoded.values():
+                    value.record_stream(current_stream)
+                apply_started = torch.cuda.Event(enable_timing=True)
+                apply_finished = torch.cuda.Event(enable_timing=True)
+                apply_started.record(current_stream)
+                self.apply_decoded_delta_group(prepared.transfer_group, prepared.decoded)
+                apply_finished.record(current_stream)
+                decode_events.append((prepared.decode_started, prepared.decode_finished))
+                apply_events.append((apply_started, apply_finished))
+                group_metrics.append(prepared.metrics)
+        finally:
+            cancelled.set()
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        synchronization_started = time.perf_counter()
+        torch.cuda.synchronize(self.device)
+        synchronization_seconds = time.perf_counter() - synchronization_started
+        pipeline_seconds = time.perf_counter() - pipeline_started
+        decode_seconds = sum(
+            prepared_start.elapsed_time(prepared_end) / 1000
+            for prepared_start, prepared_end in decode_events
+        )
+        apply_seconds = sum(start.elapsed_time(end) / 1000 for start, end in apply_events)
+        self.log_delta_metrics(
+            manifest,
+            group_metrics,
+            decode_seconds=decode_seconds,
+            apply_seconds=apply_seconds,
+            synchronization_seconds=synchronization_seconds,
+            pipeline_seconds=pipeline_seconds,
+        )
+
+    def prepare_delta_group(
+        self,
+        group_index: int,
+        transfer_group: WeightTransferGroup,
+        published_frames: tuple[NIXLDeltaFrame, ...],
+        selected_frames: list[NIXLDeltaFrame],
+        manifest: NIXLDeltaManifest,
+        slot_events: list[torch.cuda.Event | None],
+        cancelled: Event,
+    ) -> PreparedDeltaGroup:
+        torch.cuda.set_device(self.device)
+        slot = group_index % len(self.delta_receive_arenas)
+        previous_event = slot_events[slot]
+        if previous_event is not None:
+            previous_event.synchronize()
+
+        session = self.buffer_sessions[group_index % len(self.buffer_sessions)]
+        wait_started = time.perf_counter()
+        session.wait_for(
+            "trainer",
+            count=1,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+            timeout=self.weight_transfer_timeout,
+            poll_interval=_BUFFER_POLL_INTERVAL,
+            cancelled=cancelled.is_set,
+        )
+        ready_wait_seconds = time.perf_counter() - wait_started
+
+        pull_started = time.perf_counter()
+        pulled = self.pull_delta_group(
+            transfer_group,
+            selected_frames,
+            manifest,
+            receive_slot=slot,
+            cancelled=cancelled,
+        )
+        pull_seconds = time.perf_counter() - pull_started
+
+        decode_started = torch.cuda.Event(enable_timing=True)
+        decode_finished = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(self.delta_prefetch_stream):
+            decode_started.record(self.delta_prefetch_stream)
             decoded = self.decode_delta_frames(pulled)
-            self.apply_decoded_delta_group(transfer_group, decoded)
-            torch.cuda.synchronize(self.device)
-            session.set_status(p2p_pb2.SOURCE_STATUS_READY)
-            session.wait_for(
-                "trainer",
-                count=1,
-                status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
-                timeout=self.weight_transfer_timeout,
-                poll_interval=_BUFFER_POLL_INTERVAL,
-            )
-            session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+            decode_finished.record(self.delta_prefetch_stream)
+        slot_events[slot] = decode_finished
+
+        acknowledgement_started = time.perf_counter()
+        session.set_status(p2p_pb2.SOURCE_STATUS_READY)
+        session.wait_for(
+            "trainer",
+            count=1,
+            status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+            timeout=self.weight_transfer_timeout,
+            poll_interval=_BUFFER_POLL_INTERVAL,
+            cancelled=cancelled.is_set,
+        )
+        session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+        acknowledgement_seconds = time.perf_counter() - acknowledgement_started
+
+        return PreparedDeltaGroup(
+            transfer_group=transfer_group,
+            decoded=decoded,
+            decode_started=decode_started,
+            decode_finished=decode_finished,
+            metrics=DeltaGroupMetrics(
+                published_frames=len(published_frames),
+                pulled_frames=len(selected_frames),
+                published_bytes=sum(frame.compressed_nbytes for frame in published_frames),
+                pulled_bytes=sum(frame.compressed_nbytes for frame in selected_frames),
+                published_uncompressed_bytes=sum(frame.uncompressed_nbytes for frame in published_frames),
+                pulled_uncompressed_bytes=sum(frame.uncompressed_nbytes for frame in selected_frames),
+                routed_bytes=transfer_group.required_delta_nbytes,
+                wait_seconds=ready_wait_seconds,
+                pull_seconds=pull_seconds,
+                acknowledge_seconds=acknowledgement_seconds,
+            ),
+        )
 
     def pull_delta_group(
         self,
         transfer_group: WeightTransferGroup,
-        frames: tuple[NIXLDeltaFrame, ...],
+        selected: list[NIXLDeltaFrame],
         manifest: NIXLDeltaManifest,
+        *,
+        receive_slot: int,
+        cancelled: Event,
     ) -> list[tuple[NIXLDeltaFrame, torch.Tensor]]:
-        required = self.required_delta_sources(transfer_group)
-        selected = [
-            frame for frame in frames if any((frame.agent, tensor.name) in required for tensor in frame.tensors)
-        ]
         if not selected:
             return []
         logger.debug(
-            "NIXL XOR rank %d pulling %d/%d frames for %s (%.2f MiB compressed)",
+            "NIXL XOR rank %d pulling %d frames for %s (%.2f MiB compressed)",
             self.model_express.rank,
             len(selected),
-            len(frames),
             transfer_group.name,
             sum(frame.compressed_nbytes for frame in selected) / 2**20,
         )
@@ -666,7 +867,7 @@ class NIXLWeightUpdateWorker(Worker):
             used = (used + alignment - 1) // alignment * alignment
             offsets.append(used)
             used += frame.compressed_nbytes
-        arena = self.ensure_delta_receive_arena((used + alignment - 1) // alignment * alignment)
+        arena = self.delta_receive_arenas[receive_slot]
 
         local_descs: dict[int, list[MemDesc]] = defaultdict(list)
         remote_descs: dict[int, list[MemDesc]] = defaultdict(list)
@@ -689,18 +890,108 @@ class NIXLWeightUpdateWorker(Worker):
                 handle,
                 context=f"NIXL XOR pull for {transfer_group.name} from {agent.name}",
                 timeout=self.weight_transfer_timeout,
+                cancelled=cancelled.is_set,
             )
         return list(zip(selected, payloads, strict=True))
 
-    def ensure_delta_receive_arena(self, required_bytes: int) -> torch.Tensor:
-        if self.delta_receive_arena is not None and self.delta_receive_arena.numel() >= required_bytes:
-            return self.delta_receive_arena
-        if self.delta_receive_registration is not None:
-            self.nixl_agent.deregister_tensor(self.delta_receive_registration)
+    def ensure_delta_receive_arenas(self, required_bytes: int, count: int) -> None:
+        required_bytes = max(256, (required_bytes + 255) // 256 * 256)
+        if len(self.delta_receive_arenas) == count and self.delta_receive_slot_bytes >= required_bytes:
+            return
+        for registration in self.delta_receive_registrations:
+            self.nixl_agent.deregister_tensor(registration)
+        self.delta_receive_slot_bytes = required_bytes
         with use_cuda_malloc_pool():
-            self.delta_receive_arena = torch.empty(required_bytes, dtype=torch.uint8, device=self.device)
-        self.delta_receive_registration = self.nixl_agent.register_tensor(self.delta_receive_arena)
-        return self.delta_receive_arena
+            self.delta_receive_arenas = [
+                torch.empty(required_bytes, dtype=torch.uint8, device=self.device) for _ in range(count)
+            ]
+        self.delta_receive_registrations = [
+            self.nixl_agent.register_tensor(arena) for arena in self.delta_receive_arenas
+        ]
+
+    @staticmethod
+    def select_delta_frames(
+        transfer_group: WeightTransferGroup,
+        frames: tuple[NIXLDeltaFrame, ...],
+    ) -> list[NIXLDeltaFrame]:
+        required = transfer_group.required_delta_sources
+        return [frame for frame in frames if any((frame.agent, tensor.name) in required for tensor in frame.tensors)]
+
+    @staticmethod
+    def packed_delta_frame_bytes(frames: list[NIXLDeltaFrame]) -> int:
+        used = 0
+        for frame in frames:
+            used = (used + 255) // 256 * 256
+            used += frame.compressed_nbytes
+        return (used + 255) // 256 * 256
+
+    def log_delta_metrics(
+        self,
+        manifest: NIXLDeltaManifest,
+        groups: list[DeltaGroupMetrics],
+        *,
+        decode_seconds: float,
+        apply_seconds: float,
+        synchronization_seconds: float,
+        pipeline_seconds: float,
+    ) -> None:
+        published_frames = sum(group.published_frames for group in groups)
+        pulled_frames = sum(group.pulled_frames for group in groups)
+        published_bytes = sum(group.published_bytes for group in groups)
+        pulled_bytes = sum(group.pulled_bytes for group in groups)
+        published_uncompressed_bytes = sum(group.published_uncompressed_bytes for group in groups)
+        pulled_uncompressed_bytes = sum(group.pulled_uncompressed_bytes for group in groups)
+        routed_bytes = sum(group.routed_bytes for group in groups)
+        wait_seconds = sum(group.wait_seconds for group in groups)
+        pull_seconds = sum(group.pull_seconds for group in groups)
+        acknowledge_seconds = sum(group.acknowledge_seconds for group in groups)
+        ownership_filter = published_bytes / pulled_bytes if pulled_bytes else float("inf")
+        frame_inflation = pulled_uncompressed_bytes / routed_bytes if routed_bytes else float("inf")
+        route_filter = published_uncompressed_bytes / routed_bytes if routed_bytes else float("inf")
+        logger.info(
+            "NIXL XOR rank %d policy v%d metrics: groups=%d, frames=%d/%d, "
+            "compressed=%.2f/%.2f MiB, ownership_filter=%.2fx, wait=%.3fs, pull=%.3fs, "
+            "source=%.2f/%.2f/%.2f MiB, frame_inflation=%.2fx, route_filter=%.2fx, "
+            "acknowledge=%.3fs, decode=%.3fs, apply=%.3fs, final_sync=%.3fs, pipeline=%.3fs, "
+            "receive_arenas=%.2f MiB, peak_allocated=%.2f GiB",
+            self.model_express.rank,
+            manifest.step,
+            len(groups),
+            pulled_frames,
+            published_frames,
+            pulled_bytes / 2**20,
+            published_bytes / 2**20,
+            ownership_filter,
+            wait_seconds,
+            pull_seconds,
+            routed_bytes / 2**20,
+            pulled_uncompressed_bytes / 2**20,
+            published_uncompressed_bytes / 2**20,
+            frame_inflation,
+            route_filter,
+            acknowledge_seconds,
+            decode_seconds,
+            apply_seconds,
+            synchronization_seconds,
+            pipeline_seconds,
+            sum(arena.numel() for arena in self.delta_receive_arenas) / 2**20,
+            torch.cuda.max_memory_allocated(self.device) / 2**30,
+        )
+        for group_index, group in enumerate(groups):
+            logger.debug(
+                "NIXL XOR rank %d policy v%d group %d metrics: frames=%d/%d, "
+                "compressed=%.2f/%.2f MiB, wait=%.3fs, pull=%.3fs, acknowledge=%.3fs",
+                self.model_express.rank,
+                manifest.step,
+                group_index,
+                group.pulled_frames,
+                group.published_frames,
+                group.pulled_bytes / 2**20,
+                group.published_bytes / 2**20,
+                group.wait_seconds,
+                group.pull_seconds,
+                group.acknowledge_seconds,
+            )
 
     def prepare_delta_peer(self, agent_name: str, metadata: bytes) -> str:
         if self.delta_peer_metadata.get(agent_name) == metadata:
@@ -710,19 +1001,6 @@ class NIXLWeightUpdateWorker(Worker):
         self.delta_peer_metadata[agent_name] = metadata
         self.delta_peer_names[agent_name] = peer_name
         return peer_name
-
-    @staticmethod
-    def required_delta_sources(transfer_group: WeightTransferGroup) -> set[tuple[int, str]]:
-        required: set[tuple[int, str]] = set()
-        for layer in transfer_group.layers:
-            for copy_plan in (*layer.copies, *layer.persistent_copies):
-                routes = route_sharded_tensor(
-                    copy_plan.source_plan,
-                    copy_plan.source_tensor,
-                    copy_plan.staging_tensor,
-                )
-                required.update((route.agent, copy_plan.recorded_copy.source_name) for route in routes)
-        return required
 
     def decode_delta_frames(
         self,
@@ -762,11 +1040,7 @@ class NIXLWeightUpdateWorker(Worker):
     ) -> None:
         for layer in transfer_group.layers:
             for copy_plan in (*layer.copies, *layer.persistent_copies):
-                routes = route_sharded_tensor(
-                    copy_plan.source_plan,
-                    copy_plan.source_tensor,
-                    copy_plan.staging_tensor,
-                )
+                routes = copy_plan.routes
                 present = [(route.agent, copy_plan.recorded_copy.source_name) in decoded for route in routes]
                 if not any(present):
                     continue
@@ -802,7 +1076,7 @@ class NIXLWeightUpdateWorker(Worker):
     ) -> None:
         source = copy_plan.source_tensor
         destination_bytes = copy_plan.staging_tensor.view(torch.uint8).reshape(-1)
-        routes = route_sharded_tensor(copy_plan.source_plan, source, copy_plan.staging_tensor)
+        routes = copy_plan.routes
         for route in routes:
             shard = next(
                 shard
@@ -853,10 +1127,14 @@ class NIXLWeightUpdateWorker(Worker):
 
         model = self.raw_model
         cancelled = Event()
+        group_metrics: list[FullGroupMetrics] = []
+        replay_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+        pipeline_started = time.perf_counter()
 
-        def pull_group(group_index: int) -> WeightTransferGroup:
+        def pull_group(group_index: int) -> tuple[WeightTransferGroup, FullGroupMetrics]:
             transfer_group = plan.groups[group_index]
             session = self.buffer_sessions[group_index % len(self.buffer_sessions)]
+            wait_started = time.perf_counter()
             session.wait_for(
                 "trainer",
                 count=1,
@@ -865,7 +1143,9 @@ class NIXLWeightUpdateWorker(Worker):
                 poll_interval=_BUFFER_POLL_INTERVAL,
                 cancelled=cancelled.is_set,
             )
+            wait_seconds = time.perf_counter() - wait_started
 
+            pull_started = time.perf_counter()
             for local, remote, indices in transfer_group.pulls:
                 handle = self.nixl_agent.post_read(local, indices, remote)
                 self.nixl_agent.wait(
@@ -874,9 +1154,13 @@ class NIXLWeightUpdateWorker(Worker):
                     timeout=self.weight_transfer_timeout,
                     cancelled=cancelled.is_set,
                 )
-            return transfer_group
+            return transfer_group, FullGroupMetrics(
+                wait_seconds=wait_seconds,
+                pull_seconds=time.perf_counter() - pull_started,
+            )
 
-        def acknowledge_group(group_index: int) -> None:
+        def acknowledge_group(group_index: int) -> float:
+            started = time.perf_counter()
             session = self.buffer_sessions[group_index % len(self.buffer_sessions)]
             session.set_status(p2p_pb2.SOURCE_STATUS_READY)
             session.wait_for(
@@ -888,12 +1172,13 @@ class NIXLWeightUpdateWorker(Worker):
                 cancelled=cancelled.is_set,
             )
             session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+            return time.perf_counter() - started
 
-        def prefetch_group(group_index: int) -> WeightTransferGroup:
+        def prefetch_group(group_index: int) -> tuple[WeightTransferGroup, FullGroupMetrics]:
             torch.cuda.set_device(self.device)
-            transfer_group = pull_group(group_index)
-            acknowledge_group(group_index)
-            return transfer_group
+            transfer_group, metrics = pull_group(group_index)
+            metrics.acknowledge_seconds = acknowledge_group(group_index)
+            return transfer_group, metrics
 
         def replay_group(transfer_group: WeightTransferGroup) -> None:
             for layer_plan in transfer_group.layers:
@@ -931,23 +1216,68 @@ class NIXLWeightUpdateWorker(Worker):
             try:
                 pull = executor.submit(prefetch_group, 0) if executor is not None else None
                 for group_index in range(len(plan.groups)):
-                    transfer_group = pull.result() if pull is not None else pull_group(group_index)
+                    transfer_group, metrics = pull.result() if pull is not None else pull_group(group_index)
 
                     torch.cuda.synchronize(self.device)
                     if executor is not None and group_index + 1 < len(plan.groups):
                         pull = executor.submit(prefetch_group, group_index + 1)
 
+                    replay_started = torch.cuda.Event(enable_timing=True)
+                    replay_finished = torch.cuda.Event(enable_timing=True)
+                    replay_started.record(torch.cuda.current_stream(self.device))
                     replay_group(transfer_group)
+                    replay_finished.record(torch.cuda.current_stream(self.device))
                     torch.cuda.synchronize(self.device)
+                    replay_events.append((replay_started, replay_finished))
 
                     if not pipelined:
-                        acknowledge_group(group_index)
+                        metrics.acknowledge_seconds = acknowledge_group(group_index)
+                    group_metrics.append(metrics)
             finally:
                 cancelled.set()
                 if executor is not None:
                     executor.shutdown(wait=True, cancel_futures=True)
 
             finalize_layerwise_reload(model, self.model_runner.model_config)
+        self.log_full_metrics(
+            plan,
+            group_metrics,
+            replay_seconds=sum(start.elapsed_time(end) / 1000 for start, end in replay_events),
+            pipeline_seconds=time.perf_counter() - pipeline_started,
+        )
+
+    def log_full_metrics(
+        self,
+        plan: WeightTransferPlan,
+        groups: list[FullGroupMetrics],
+        *,
+        replay_seconds: float,
+        pipeline_seconds: float,
+    ) -> None:
+        published_bytes = sum(
+            prod(tensor.shape) * getattr(torch, tensor.wire_dtype).itemsize
+            for group in plan.table.groups
+            for tensor in group.tensors
+        )
+        pulled_bytes = sum(group.pull_nbytes for group in plan.groups)
+        ownership_filter = published_bytes / pulled_bytes if pulled_bytes else float("inf")
+        logger.info(
+            "NIXL full rank %d metrics: groups=%d, bytes=%.2f/%.2f MiB, ownership_filter=%.2fx, "
+            "wait=%.3fs, pull=%.3fs, acknowledge=%.3fs, replay=%.3fs, pipeline=%.3fs, "
+            "receive_arenas=%.2f MiB, peak_allocated=%.2f GiB",
+            self.model_express.rank,
+            len(groups),
+            pulled_bytes / 2**20,
+            published_bytes / 2**20,
+            ownership_filter,
+            sum(group.wait_seconds for group in groups),
+            sum(group.pull_seconds for group in groups),
+            sum(group.acknowledge_seconds for group in groups),
+            replay_seconds,
+            pipeline_seconds,
+            sum(arena.numel() * arena.element_size() for arena in plan.receive_arenas.values()) / 2**20,
+            torch.cuda.max_memory_allocated(self.device) / 2**30,
+        )
 
     @staticmethod
     def replay_tensor_copy(plan: TensorCopyPlan) -> None:

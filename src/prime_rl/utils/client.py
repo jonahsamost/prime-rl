@@ -424,14 +424,14 @@ async def update_weights(
         # Pause engines so all DP workers drain in-flight work and can join the NCCL broadcast
         await _pause_engines(admin_clients, step=step)
 
-        try:
-            # Create ready marker before servers enter receive path (used by NCCL broadcast)
-            if weight_dir is not None:
-                nccl_ready_file = weight_dir / NCCL_READY_MARKER
-                nccl_ready_file.parent.mkdir(parents=True, exist_ok=True)
-                nccl_ready_file.touch()
-                logger.debug(f"Created NCCL_READY marker at {nccl_ready_file}")
+        # Create ready marker before servers enter receive path (used by NCCL broadcast)
+        if weight_dir is not None:
+            nccl_ready_file = weight_dir / NCCL_READY_MARKER
+            nccl_ready_file.parent.mkdir(parents=True, exist_ok=True)
+            nccl_ready_file.touch()
+            logger.debug(f"Created NCCL_READY marker at {nccl_ready_file}")
 
+        try:
             await asyncio.gather(
                 *[
                     _admin_post(
@@ -443,8 +443,10 @@ async def update_weights(
                     for admin_client in admin_clients
                 ]
             )
-        finally:
-            await _resume_engines(admin_clients)
+        except BaseException:
+            logger.exception("Weight update failed; inference engines remain paused to protect policy consistency")
+            raise
+        await _resume_engines(admin_clients)
 
 
 def _is_retryable_lora_error(exception: BaseException) -> bool:

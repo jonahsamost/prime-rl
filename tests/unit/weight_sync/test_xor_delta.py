@@ -259,8 +259,8 @@ def test_delta_adamw_matches_adamw_and_emits_exact_parameter_xor(dtype):
     update = delta_optimizer.take_delta_update()
 
     assert update is not None
-    assert len(update.frames) == 1
-    assert update.frames[0].tensor_count == len(old_state)
+    assert len(update.frames) == len(old_state)
+    assert all(frame.tensor_count == 1 for frame in update.frames)
     decoded = _decode_update(update)
     assert decoded.keys() == old_state.keys()
     for (name, delta_parameter), reference_parameter in zip(

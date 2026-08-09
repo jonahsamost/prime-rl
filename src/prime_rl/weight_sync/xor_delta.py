@@ -120,6 +120,11 @@ class PendingDeltaFrame:
     first_tensor_index: int
     tensor_count: int
     uncompressed_nbytes: int
+
+
+@dataclass(frozen=True)
+class PendingDeltaBatch:
+    frames: tuple[PendingDeltaFrame, ...]
     encode: PendingNvcompEncode
 
 
@@ -414,7 +419,7 @@ class DeltaEncoder:
         self._frames: list[CompressedDeltaFrame] = []
         self._payload: Tensor | None = None
         self._payload_size = 0
-        self._pending: deque[PendingDeltaFrame] = deque()
+        self._pending: deque[PendingDeltaBatch] = deque()
         self._finished = False
 
     def append(self, name: str, delta: Tensor) -> None:
@@ -453,6 +458,7 @@ class DeltaEncoder:
         shard_dim: int | None = None,
         shard_index: int = 0,
         shard_count: int = 1,
+        separate_frames: bool = False,
     ) -> None:
         if self._finished:
             raise RuntimeError("cannot append to a finished XOR delta encoder")
@@ -509,14 +515,26 @@ class DeltaEncoder:
         )
         first_tensor_index = len(self._tensors)
         self._tensors.extend(metadata)
-        self._pending.append(
-            PendingDeltaFrame(
-                first_tensor_index=first_tensor_index,
-                tensor_count=len(metadata),
-                uncompressed_nbytes=bucket.numel() * bucket.element_size(),
-                encode=self.codec.submit_encode([bucket]),
+        if separate_frames:
+            frames = tuple(
+                PendingDeltaFrame(
+                    first_tensor_index=first_tensor_index + index,
+                    tensor_count=1,
+                    uncompressed_nbytes=value.numel() * value.element_size(),
+                )
+                for index, (_name, value) in enumerate(normalized)
             )
-        )
+            encode = self.codec.submit_encode([value for _name, value in normalized])
+        else:
+            frames = (
+                PendingDeltaFrame(
+                    first_tensor_index=first_tensor_index,
+                    tensor_count=len(metadata),
+                    uncompressed_nbytes=bucket.numel() * bucket.element_size(),
+                ),
+            )
+            encode = self.codec.submit_encode([bucket])
+        self._pending.append(PendingDeltaBatch(frames=frames, encode=encode))
         if len(self._pending) >= self.pipeline_depth:
             self._finalize_oldest()
 
@@ -553,22 +571,33 @@ class DeltaEncoder:
     def _finalize_oldest(self) -> None:
         pending = self._pending.popleft()
         compressed_sizes = tuple(item.buffer_size for item in pending.encode.encoded)
-        if len(compressed_sizes) != 1:
-            raise RuntimeError(f"nvCOMP returned {len(compressed_sizes)} frames for one XOR delta bucket")
-        compressed_nbytes = compressed_sizes[0]
-        offset = _align_up(self._payload_size, NVCOMP_FRAME_ALIGNMENT)
-        self._reserve_payload(offset + compressed_nbytes)
+        if len(compressed_sizes) != len(pending.frames):
+            raise RuntimeError(
+                f"nvCOMP returned {len(compressed_sizes)} frames for "
+                f"{len(pending.frames)} XOR delta inputs"
+            )
+        offsets: list[int] = []
+        required = self._payload_size
+        for compressed_nbytes in compressed_sizes:
+            required = _align_up(required, NVCOMP_FRAME_ALIGNMENT)
+            offsets.append(required)
+            required += compressed_nbytes
+        self._reserve_payload(required)
         assert self._payload is not None
-        destination = self._payload.narrow(0, offset, compressed_nbytes)
-        self.codec.copy_encoded(pending.encode, [destination], compressed_sizes)
-        self._payload_size = offset + compressed_nbytes
-        self._frames.append(
+        destinations = [
+            self._payload.narrow(0, offset, compressed_nbytes)
+            for offset, compressed_nbytes in zip(offsets, compressed_sizes, strict=True)
+        ]
+        self.codec.copy_encoded(pending.encode, destinations, compressed_sizes)
+        self._payload_size = required
+        self._frames.extend(
             CompressedDeltaFrame(
-                first_tensor_index=pending.first_tensor_index,
-                tensor_count=pending.tensor_count,
-                uncompressed_nbytes=pending.uncompressed_nbytes,
+                first_tensor_index=frame.first_tensor_index,
+                tensor_count=frame.tensor_count,
+                uncompressed_nbytes=frame.uncompressed_nbytes,
                 compressed_nbytes=compressed_nbytes,
             )
+            for frame, compressed_nbytes in zip(pending.frames, compressed_sizes, strict=True)
         )
 
     def _reserve_payload(self, required: int) -> None:

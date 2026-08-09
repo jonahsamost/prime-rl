@@ -477,6 +477,9 @@ class NIXLWeightBroadcast(WeightBroadcast):
         if delta_update is not None:
             self.broadcast_delta(delta_update, step, ready_runs)
             return
+        self.broadcast_full(step, ready_runs)
+
+    def broadcast_full(self, step: int, ready_runs: list[int], *, reason: str | None = None) -> None:
         if self.world.is_master:
             assert self.trainer_table is not None
             self.update_session.publish(
@@ -530,7 +533,11 @@ class NIXLWeightBroadcast(WeightBroadcast):
         self.finish_policy_transfer()
         for run_index in ready_runs:
             self.multi_run_manager.ready_to_update[run_index] = False
-        self.logger.info(f"NIXL+ModelExpress policy v{step} synchronized in {time.perf_counter() - start:.2f}s")
+        reason_suffix = f" ({reason})" if reason is not None else ""
+        self.logger.info(
+            f"NIXL+ModelExpress full policy v{step} synchronized in {time.perf_counter() - start:.2f}s"
+            f"{reason_suffix}"
+        )
 
     def build_local_delta_manifest(self, update: DeltaUpdate) -> NIXLDeltaManifest:
         groups = build_local_delta_groups(update, self.transfer_group_names)
@@ -617,9 +624,18 @@ class NIXLWeightBroadcast(WeightBroadcast):
             raise ValueError(f"delta step {update.step} does not match broadcast step {step}")
         start = time.perf_counter()
         manifest = self.gather_delta_manifest(update)
+        fallback_to_full = False
         if manifest is not None:
             compressed_nbytes = sum(frame.compressed_nbytes for group in manifest.groups for frame in group.frames)
             uncompressed_nbytes = sum(frame.uncompressed_nbytes for group in manifest.groups for frame in group.frames)
+            fallback_to_full = compressed_nbytes >= uncompressed_nbytes
+        decision = [fallback_to_full]
+        dist.broadcast_object_list(decision, src=0)
+        if decision[0]:
+            self.broadcast_full(step, ready_runs, reason="XOR payload was not smaller than full weights")
+            return
+
+        if manifest is not None:
             self.update_session.publish(
                 nixl_metadata=NIXLPolicyMetadata(
                     kind="xor",

@@ -184,6 +184,7 @@ class DeltaAdamW(AdamW):
                         old_bucket,
                         global_shapes=[descriptor[0] for descriptor in shard_descriptors],
                         shard_descriptors=[descriptor[1:] for descriptor in shard_descriptors],
+                        separate_frames=True,
                     )
                     del local_parameters, old_values, old_bucket
             if self._encoder is not None:

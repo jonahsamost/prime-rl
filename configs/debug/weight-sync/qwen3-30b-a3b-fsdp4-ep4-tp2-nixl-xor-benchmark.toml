@@ -1,15 +1,16 @@
-max_steps = 6
+max_steps = 26
 seq_len = 256
 
 [env_vars]
 UCX_TLS = "all"
 
 [model]
-name = "samsja/mini-glm-moe"
+name = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 [trainer.model]
 impl = "custom"
 optimization_dtype = "bfloat16"
+moe_router_dtype = "bfloat16"
 compile = "None"
 optim_cpu_offload = false
 dp_replicate = 1
@@ -32,7 +33,7 @@ type = "zero_advantage"
 enforce = false
 
 [orchestrator.renderer]
-name = "default"
+name = "qwen3"
 
 [orchestrator.train.sampling]
 max_completion_tokens = 64
