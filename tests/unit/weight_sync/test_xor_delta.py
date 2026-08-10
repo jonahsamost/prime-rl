@@ -87,6 +87,29 @@ def test_nvcomp_lz4_cuda_encode_decode_round_trip_is_byte_exact(dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_nvcomp_lz4_cuda_decode_into_reuses_outputs_byte_exactly(dtype):
+    device = torch.device("cuda", torch.cuda.current_device())
+    generator = torch.Generator(device=device).manual_seed(17)
+    batches = [
+        [
+            _random_bits((1024, 128), dtype, device=device, generator=generator),
+            _random_bits((257,), dtype, device=device, generator=generator),
+        ]
+        for _ in range(2)
+    ]
+    codec = NvcompLZ4Codec(device)
+    outputs = [
+        torch.empty(value.numel() * value.element_size(), dtype=torch.uint8, device=device) for value in batches[0]
+    ]
+
+    for values in batches:
+        codec.decode_into(codec.encode(values), outputs)
+        codec.synchronize()
+        for value, output in zip(values, outputs, strict=True):
+            assert torch.equal(value.view(torch.uint8).reshape(-1), output)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_delta_adamw_matches_adamw_and_emits_exact_parameter_xor(dtype):
     device = torch.device("cuda", torch.cuda.current_device())
     reference = nn.Sequential(

@@ -10,7 +10,7 @@ from torch import Tensor
 from torch.distributed.tensor import DTensor
 
 NVCOMP_FRAME_ALIGNMENT = 256
-DEFAULT_NVCOMP_PIPELINE_DEPTH = 2
+DEFAULT_NVCOMP_PIPELINE_DEPTH = 8
 SUPPORTED_DELTA_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 _DTYPE_NAMES = {
@@ -274,15 +274,31 @@ class NvcompLZ4Codec:
         sizes = tuple(uncompressed_nbytes)
         if len(payloads) != len(sizes):
             raise ValueError(f"received {len(payloads)} compressed frames for {len(sizes)} output sizes")
+        outputs = [torch.empty(size, dtype=torch.uint8, device=self.device) for size in sizes]
+        self.decode_into(payloads, outputs)
+        return outputs
+
+    def decode_into(
+        self,
+        payloads: Sequence[Tensor],
+        outputs: Sequence[Tensor],
+    ) -> None:
+        if not payloads:
+            if outputs:
+                raise ValueError(f"received {len(outputs)} decode outputs for no compressed frames")
+            return
+        if len(payloads) != len(outputs):
+            raise ValueError(f"received {len(outputs)} decode outputs for {len(payloads)} compressed frames")
+        byte_outputs = [self._byte_view(output) for output in outputs]
+        sizes = tuple(output.numel() for output in byte_outputs)
         consumer_stream = torch.cuda.current_stream(self.device)
         self.stream.wait_stream(consumer_stream)
-        for payload in payloads:
-            payload.record_stream(self.stream)
+        for value in (*payloads, *outputs):
+            value.record_stream(self.stream)
 
         with torch.cuda.stream(self.stream):
-            outputs = [torch.empty(size, dtype=torch.uint8, device=self.device) for size in sizes]
             sources = self.nvcomp.as_arrays(payloads, cuda_stream=self.stream.cuda_stream)
-            destinations = self.nvcomp.as_arrays(outputs, cuda_stream=self.stream.cuda_stream)
+            destinations = self.nvcomp.as_arrays(byte_outputs, cuda_stream=self.stream.cuda_stream)
             decompression_config = self._decompression_config(sizes, sources)
             self.codec.decode(
                 sources,
@@ -290,7 +306,6 @@ class NvcompLZ4Codec:
                 decompression_config=decompression_config,
             )
         consumer_stream.wait_stream(self.stream)
-        return outputs
 
     def synchronize(self) -> None:
         self.stream.synchronize()

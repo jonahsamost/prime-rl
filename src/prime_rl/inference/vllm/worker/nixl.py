@@ -66,6 +66,22 @@ else:
 logger = init_logger("vllm.inference.vllm.worker_nixl")
 
 
+@dataclass(frozen=True)
+class DeltaSourceSpec:
+    key: tuple[int, str]
+    dtype: str
+    global_shape: tuple[int, ...]
+    nbytes: int
+
+
+@dataclass(frozen=True)
+class DeltaRouteBinding:
+    source: DeltaSourceSpec
+    source_offset: int
+    staging_offset: int
+    nbytes: int
+
+
 @dataclass
 class TensorCopyPlan:
     recorded_copy: RecordedCopy
@@ -74,6 +90,9 @@ class TensorCopyPlan:
     source_plan: TensorReplayPlan
     replay_ops: OperationChain
     routes: list[TensorRoute]
+    delta_routes: tuple[DeltaRouteBinding, ...]
+    required_delta_sources: frozenset[tuple[int, str]]
+    direct_delta_xor: bool
 
 
 @dataclass
@@ -95,6 +114,7 @@ class WeightTransferGroup:
     pull_nbytes: int
     required_delta_sources: frozenset[tuple[int, str]]
     required_delta_nbytes: int
+    delta_source_specs: dict[tuple[int, str], DeltaSourceSpec]
 
 
 @dataclass
@@ -194,6 +214,8 @@ class NIXLWeightUpdateWorker(Worker):
         self.delta_receive_arenas: list[torch.Tensor] = []
         self.delta_receive_registrations: list[Any] = []
         self.delta_receive_slot_bytes = 0
+        self.delta_decode_arenas: list[torch.Tensor] = []
+        self.delta_decode_slot_bytes = 0
         self.delta_prefetch_stream = torch.cuda.Stream(device=self.device)
         self.receive_registrations: list[Any] = []
         self.weight_transfer_plan: WeightTransferPlan | None = None
@@ -292,6 +314,10 @@ class NIXLWeightUpdateWorker(Worker):
 
     @staticmethod
     def validate_delta_transfer_plan(plan: WeightTransferPlan) -> None:
+        direct_bytes = 0
+        routed_bytes = 0
+        direct_copies = 0
+        copy_count = 0
         for group in plan.groups:
             for layer in group.layers:
                 for copy_plan in (*layer.copies, *layer.persistent_copies):
@@ -315,6 +341,21 @@ class NIXLWeightUpdateWorker(Worker):
                             f"{value.dtype}{tuple(value.shape)} -> "
                             f"{destination.dtype}{tuple(destination.shape)}"
                         )
+                    copy_plan.direct_delta_xor = not copy_plan.replay_ops and destination.is_contiguous()
+                    nbytes = destination.numel() * destination.element_size()
+                    routed_bytes += nbytes
+                    copy_count += 1
+                    if copy_plan.direct_delta_xor:
+                        direct_bytes += nbytes
+                        direct_copies += 1
+        logger.info(
+            "NIXL XOR direct route coverage: %.2f/%.2f MiB (%.1f%%), copies=%d/%d",
+            direct_bytes / 2**20,
+            routed_bytes / 2**20,
+            100 * direct_bytes / routed_bytes if routed_bytes else 100.0,
+            direct_copies,
+            copy_count,
+        )
 
     def trace_weight_loads(
         self,
@@ -563,6 +604,7 @@ class NIXLWeightUpdateWorker(Worker):
                 for dtype, elements in receive_buffer_elements.items()
             }
             delta_source_ranges: dict[tuple[int, str], list[tuple[int, int]]] = defaultdict(list)
+            delta_source_specs: dict[tuple[int, str], DeltaSourceSpec] = {}
 
             for copy in copies_by_group[group_index]:
                 replay_plan = replay_plans[id(copy)]
@@ -572,15 +614,23 @@ class NIXLWeightUpdateWorker(Worker):
                 cursor = cursors[source_dtype]
                 staging_tensor = receive_arenas[source_dtype].narrow(0, cursor, numel).view(replay_plan.source_shape)
                 cursors[source_dtype] += numel
+                routes = route_sharded_tensor(replay_plan, source, staging_tensor)
+                delta_routes = self.bind_delta_routes(copy, source, staging_tensor, routes)
+                for binding in delta_routes:
+                    previous = delta_source_specs.setdefault(binding.source.key, binding.source)
+                    if previous != binding.source:
+                        raise RuntimeError(f"inconsistent NIXL XOR source metadata for {binding.source.key}")
                 copy_plan = TensorCopyPlan(
                     recorded_copy=copy,
                     staging_tensor=staging_tensor,
                     source_tensor=source,
                     source_plan=replay_plan,
                     replay_ops=replay_plan.replay_ops,
-                    routes=[],
+                    routes=routes,
+                    delta_routes=delta_routes,
+                    required_delta_sources=frozenset(binding.source.key for binding in delta_routes),
+                    direct_delta_xor=False,
                 )
-                copy_plan.routes = route_sharded_tensor(replay_plan, source, staging_tensor)
                 plans = persistent_plans_by_layer if copy.is_persistent else copy_plans_by_layer
                 plans[id(copy.destination_module)].append(copy_plan)
 
@@ -613,9 +663,56 @@ class NIXLWeightUpdateWorker(Worker):
                         for route in copy_plan.routes
                     ),
                     required_delta_nbytes=sum(_covered_nbytes(ranges) for ranges in delta_source_ranges.values()),
+                    delta_source_specs=delta_source_specs,
                 )
             )
         return transfer_groups
+
+    @staticmethod
+    def bind_delta_routes(
+        copy: RecordedCopy,
+        source: TrainerTensor,
+        staging_tensor: torch.Tensor,
+        routes: list[TensorRoute],
+    ) -> tuple[DeltaRouteBinding, ...]:
+        itemsize = staging_tensor.element_size()
+        bindings: list[DeltaRouteBinding] = []
+        for route in routes:
+            shard = next(
+                (
+                    candidate
+                    for candidate in source.shards
+                    if candidate.agent == route.agent
+                    and candidate.addr <= route.source_addr < candidate.addr + candidate.numel * itemsize
+                ),
+                None,
+            )
+            if shard is None:
+                raise RuntimeError(
+                    f"NIXL XOR route for {copy.source_name!r} does not resolve to trainer agent {route.agent}"
+                )
+            source_offset = route.source_addr - shard.addr
+            staging_offset = route.destination_addr - staging_tensor.data_ptr()
+            source_nbytes = shard.numel * itemsize
+            staging_nbytes = staging_tensor.numel() * itemsize
+            if source_offset < 0 or source_offset + route.nbytes > source_nbytes:
+                raise RuntimeError(f"NIXL XOR route exceeds source shard bounds for {copy.source_name!r}")
+            if staging_offset < 0 or staging_offset + route.nbytes > staging_nbytes:
+                raise RuntimeError(f"NIXL XOR route exceeds staging bounds for {copy.source_name!r}")
+            bindings.append(
+                DeltaRouteBinding(
+                    source=DeltaSourceSpec(
+                        key=(route.agent, copy.source_name),
+                        dtype=source.wire_dtype,
+                        global_shape=tuple(source.shape),
+                        nbytes=source_nbytes,
+                    ),
+                    source_offset=source_offset,
+                    staging_offset=staging_offset,
+                    nbytes=route.nbytes,
+                )
+            )
+        return tuple(bindings)
 
     def build_layer_transfer_plans(
         self,
@@ -748,8 +845,14 @@ class NIXLWeightUpdateWorker(Worker):
         ]
         receive_buffer_count = min(2, len(plan.groups))
         slot_bytes = max((self.packed_delta_frame_bytes(frames) for frames in selected_by_group), default=0)
+        decode_slot_bytes = max(
+            (self.packed_delta_decoded_frame_bytes(frames) for frames in selected_by_group),
+            default=0,
+        )
         self.ensure_delta_receive_arenas(slot_bytes, receive_buffer_count)
-        slot_events: list[torch.cuda.Event | None] = [None] * receive_buffer_count
+        self.ensure_delta_decode_arenas(decode_slot_bytes, receive_buffer_count)
+        receive_slot_events: list[torch.cuda.Event | None] = [None] * receive_buffer_count
+        decode_slot_events: list[torch.cuda.Event | None] = [None] * receive_buffer_count
         decode_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         apply_events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         group_metrics: list[DeltaGroupMetrics] = []
@@ -766,7 +869,8 @@ class NIXLWeightUpdateWorker(Worker):
                 manifest.groups[0].frames,
                 selected_by_group[0],
                 manifest,
-                slot_events,
+                receive_slot_events,
+                decode_slot_events,
                 cancelled,
             )
             for group_index in range(len(plan.groups)):
@@ -779,19 +883,18 @@ class NIXLWeightUpdateWorker(Worker):
                         manifest.groups[group_index + 1].frames,
                         selected_by_group[group_index + 1],
                         manifest,
-                        slot_events,
+                        receive_slot_events,
+                        decode_slot_events,
                         cancelled,
                     )
 
                 current_stream.wait_event(prepared.decode_finished)
-                # Decode allocates on a side stream; keep its storage alive through asynchronous apply.
-                for value, _metadata in prepared.decoded.values():
-                    value.record_stream(current_stream)
                 apply_started = torch.cuda.Event(enable_timing=True)
                 apply_finished = torch.cuda.Event(enable_timing=True)
                 apply_started.record(current_stream)
                 self.apply_decoded_delta_group(prepared.transfer_group, prepared.decoded)
                 apply_finished.record(current_stream)
+                decode_slot_events[group_index % receive_buffer_count] = apply_finished
                 decode_events.append((prepared.decode_started, prepared.decode_finished))
                 apply_events.append((apply_started, apply_finished))
                 group_metrics.append(prepared.metrics)
@@ -824,14 +927,15 @@ class NIXLWeightUpdateWorker(Worker):
         published_frames: tuple[NIXLDeltaFrame, ...],
         selected_frames: list[NIXLDeltaFrame],
         manifest: NIXLDeltaManifest,
-        slot_events: list[torch.cuda.Event | None],
+        receive_slot_events: list[torch.cuda.Event | None],
+        decode_slot_events: list[torch.cuda.Event | None],
         cancelled: Event,
     ) -> PreparedDeltaGroup:
         torch.cuda.set_device(self.device)
         slot = group_index % len(self.delta_receive_arenas)
-        previous_event = slot_events[slot]
-        if previous_event is not None:
-            previous_event.synchronize()
+        previous_receive_event = receive_slot_events[slot]
+        if previous_receive_event is not None:
+            previous_receive_event.synchronize()
 
         wait_started = time.perf_counter()
         self.wait_for_group_ready(
@@ -857,11 +961,14 @@ class NIXLWeightUpdateWorker(Worker):
 
         decode_started = torch.cuda.Event(enable_timing=True)
         decode_finished = torch.cuda.Event(enable_timing=True)
+        previous_decode_event = decode_slot_events[slot]
+        if previous_decode_event is not None:
+            previous_decode_event.synchronize()
         with torch.cuda.stream(self.delta_prefetch_stream):
             decode_started.record(self.delta_prefetch_stream)
-            decoded = self.decode_delta_frames(pulled)
+            decoded = self.decode_delta_frames(pulled, decode_slot=slot)
             decode_finished.record(self.delta_prefetch_stream)
-        slot_events[slot] = decode_finished
+        receive_slot_events[slot] = decode_finished
 
         return PreparedDeltaGroup(
             transfer_group=transfer_group,
@@ -949,6 +1056,16 @@ class NIXLWeightUpdateWorker(Worker):
             self.nixl_agent.register_tensor(arena) for arena in self.delta_receive_arenas
         ]
 
+    def ensure_delta_decode_arenas(self, required_bytes: int, count: int) -> None:
+        required_bytes = max(NVCOMP_FRAME_ALIGNMENT, align_nvcomp_nbytes(required_bytes))
+        if len(self.delta_decode_arenas) == count and self.delta_decode_slot_bytes >= required_bytes:
+            return
+        self.delta_decode_slot_bytes = required_bytes
+        with use_cuda_malloc_pool():
+            self.delta_decode_arenas = [
+                torch.empty(required_bytes, dtype=torch.uint8, device=self.device) for _ in range(count)
+            ]
+
     @staticmethod
     def select_delta_frames(
         transfer_group: WeightTransferGroup,
@@ -963,6 +1080,14 @@ class NIXLWeightUpdateWorker(Worker):
         for frame in frames:
             used = align_nvcomp_nbytes(used)
             used += frame.compressed_nbytes
+        return align_nvcomp_nbytes(used)
+
+    @staticmethod
+    def packed_delta_decoded_frame_bytes(frames: list[NIXLDeltaFrame]) -> int:
+        used = 0
+        for frame in frames:
+            used = align_nvcomp_nbytes(used)
+            used += frame.uncompressed_nbytes
         return align_nvcomp_nbytes(used)
 
     def log_delta_metrics(
@@ -993,7 +1118,7 @@ class NIXLWeightUpdateWorker(Worker):
             "compressed=%.2f/%.2f MiB, ownership_filter=%.2fx, wait=%.3fs, pull=%.3fs, "
             "source=%.2f/%.2f/%.2f MiB, frame_inflation=%.2fx, route_filter=%.2fx, "
             "acknowledge=%.3fs, decode=%.3fs, apply=%.3fs, final_sync=%.3fs, pipeline=%.3fs, "
-            "receive_arenas=%.2f MiB, peak_allocated=%.2f GiB",
+            "receive_arenas=%.2f MiB, decode_arenas=%.2f MiB, peak_allocated=%.2f GiB",
             self.model_express.rank,
             manifest.step,
             len(groups),
@@ -1015,6 +1140,7 @@ class NIXLWeightUpdateWorker(Worker):
             synchronization_seconds,
             pipeline_seconds,
             sum(arena.numel() for arena in self.delta_receive_arenas) / 2**20,
+            sum(arena.numel() for arena in self.delta_decode_arenas) / 2**20,
             torch.cuda.max_memory_allocated(self.device) / 2**30,
         )
         for group_index, group in enumerate(groups):
@@ -1045,13 +1171,22 @@ class NIXLWeightUpdateWorker(Worker):
     def decode_delta_frames(
         self,
         pulled: list[tuple[NIXLDeltaFrame, torch.Tensor]],
+        *,
+        decode_slot: int,
     ) -> dict[tuple[int, str], tuple[torch.Tensor, DeltaTensorMetadata]]:
         if not pulled:
             return {}
         assert self.delta_codec is not None
-        decoded_frames = self.delta_codec.decode(
+        arena = self.delta_decode_arenas[decode_slot]
+        decoded_frames: list[torch.Tensor] = []
+        used = 0
+        for frame, _payload in pulled:
+            used = align_nvcomp_nbytes(used)
+            decoded_frames.append(arena.narrow(0, used, frame.uncompressed_nbytes))
+            used += frame.uncompressed_nbytes
+        self.delta_codec.decode_into(
             [payload for _frame, payload in pulled],
-            [frame.uncompressed_nbytes for frame, _payload in pulled],
+            decoded_frames,
         )
         decoded: dict[tuple[int, str], tuple[torch.Tensor, DeltaTensorMetadata]] = {}
         for (frame, _payload), raw in zip(pulled, decoded_frames, strict=True):
@@ -1078,17 +1213,17 @@ class NIXLWeightUpdateWorker(Worker):
         transfer_group: WeightTransferGroup,
         decoded: dict[tuple[int, str], tuple[torch.Tensor, DeltaTensorMetadata]],
     ) -> None:
+        NIXLWeightUpdateWorker.validate_decoded_delta_sources(transfer_group, decoded)
         for layer in transfer_group.layers:
             for copy_plan in (*layer.copies, *layer.persistent_copies):
-                routes = copy_plan.routes
-                present = [(route.agent, copy_plan.recorded_copy.source_name) in decoded for route in routes]
-                if not any(present):
+                required = copy_plan.required_delta_sources
+                present = required.intersection(decoded)
+                if not present:
                     continue
-                if not all(present):
+                if present != required:
                     raise RuntimeError(
                         f"NIXL XOR update has incomplete shards for {copy_plan.recorded_copy.source_name!r}"
                     )
-                NIXLWeightUpdateWorker.populate_delta_staging(copy_plan, decoded)
                 copy = copy_plan.recorded_copy
                 parameter = getattr(copy.destination_module, copy.destination_name)
                 destination = parameter.as_strided(
@@ -1096,6 +1231,10 @@ class NIXLWeightUpdateWorker(Worker):
                     copy.destination_stride,
                     copy.destination_offset,
                 )
+                if copy_plan.direct_delta_xor:
+                    NIXLWeightUpdateWorker.apply_direct_delta_routes(copy_plan, destination, decoded)
+                    continue
+                NIXLWeightUpdateWorker.populate_delta_staging(copy_plan, decoded)
                 value = apply_chain(copy_plan.staging_tensor, copy_plan.replay_ops)
                 if value.dtype != destination.dtype or tuple(value.shape) != tuple(destination.shape):
                     raise RuntimeError(
@@ -1110,48 +1249,54 @@ class NIXLWeightUpdateWorker(Worker):
                     destination.copy_(updated)
 
     @staticmethod
+    def validate_decoded_delta_sources(
+        transfer_group: WeightTransferGroup,
+        decoded: dict[tuple[int, str], tuple[torch.Tensor, DeltaTensorMetadata]],
+    ) -> None:
+        for key, spec in transfer_group.delta_source_specs.items():
+            item = decoded.get(key)
+            if item is None:
+                continue
+            value, metadata = item
+            if metadata.dtype != spec.dtype:
+                raise RuntimeError(
+                    f"NIXL XOR source dtype {metadata.dtype} does not match wire dtype "
+                    f"{spec.dtype} for {metadata.name!r}"
+                )
+            if metadata.resolved_global_shape != spec.global_shape:
+                raise RuntimeError(
+                    f"NIXL XOR source shape {metadata.resolved_global_shape} does not match "
+                    f"the transfer table shape {spec.global_shape} for {metadata.name!r}"
+                )
+            if metadata.nbytes != spec.nbytes or value.numel() * value.element_size() != spec.nbytes:
+                raise RuntimeError(
+                    f"NIXL XOR shard for {metadata.name!r} has {metadata.nbytes} bytes; "
+                    f"the transfer table requires {spec.nbytes}"
+                )
+
+    @staticmethod
+    def apply_direct_delta_routes(
+        copy_plan: TensorCopyPlan,
+        destination: torch.Tensor,
+        decoded: dict[tuple[int, str], tuple[torch.Tensor, DeltaTensorMetadata]],
+    ) -> None:
+        destination_bytes = destination.view(torch.uint8).reshape(-1)
+        for binding in copy_plan.delta_routes:
+            source = decoded[binding.source.key][0].view(torch.uint8).reshape(-1)
+            destination_bytes.narrow(0, binding.staging_offset, binding.nbytes).bitwise_xor_(
+                source.narrow(0, binding.source_offset, binding.nbytes)
+            )
+
+    @staticmethod
     def populate_delta_staging(
         copy_plan: TensorCopyPlan,
         decoded: dict[tuple[int, str], tuple[torch.Tensor, DeltaTensorMetadata]],
     ) -> None:
-        source = copy_plan.source_tensor
         destination_bytes = copy_plan.staging_tensor.view(torch.uint8).reshape(-1)
-        routes = copy_plan.routes
-        for route in routes:
-            shard = next(
-                shard
-                for shard in source.shards
-                if shard.agent == route.agent
-                and shard.addr <= route.source_addr < shard.addr + shard.numel * copy_plan.staging_tensor.element_size()
-            )
-            try:
-                value, metadata = decoded[(route.agent, copy_plan.recorded_copy.source_name)]
-            except KeyError as error:
-                raise RuntimeError(
-                    f"missing decoded NIXL XOR shard for agent {route.agent}, "
-                    f"tensor {copy_plan.recorded_copy.source_name!r}"
-                ) from error
-            if metadata.dtype != str(copy_plan.staging_tensor.dtype).removeprefix("torch."):
-                raise RuntimeError(
-                    f"NIXL XOR source dtype {metadata.dtype} does not match wire dtype "
-                    f"{copy_plan.staging_tensor.dtype} for {metadata.name!r}"
-                )
-            if metadata.resolved_global_shape != tuple(source.shape):
-                raise RuntimeError(
-                    f"NIXL XOR source shape {metadata.resolved_global_shape} does not match "
-                    f"the transfer table shape {tuple(source.shape)} for {metadata.name!r}"
-                )
-            expected_shard_bytes = shard.numel * copy_plan.staging_tensor.element_size()
-            if metadata.nbytes != expected_shard_bytes:
-                raise RuntimeError(
-                    f"NIXL XOR shard for {metadata.name!r} has {metadata.nbytes} bytes; "
-                    f"the transfer table requires {expected_shard_bytes}"
-                )
-            source_offset = route.source_addr - shard.addr
-            destination_offset = route.destination_addr - copy_plan.staging_tensor.data_ptr()
-            source_bytes = value.view(torch.uint8).reshape(-1)
-            destination_bytes.narrow(0, destination_offset, route.nbytes).copy_(
-                source_bytes.narrow(0, source_offset, route.nbytes)
+        for binding in copy_plan.delta_routes:
+            source_bytes = decoded[binding.source.key][0].view(torch.uint8).reshape(-1)
+            destination_bytes.narrow(0, binding.staging_offset, binding.nbytes).copy_(
+                source_bytes.narrow(0, binding.source_offset, binding.nbytes)
             )
 
     def apply_transfer_plan(self, plan: WeightTransferPlan, *, step: int) -> None:
