@@ -21,7 +21,7 @@ from prime_rl.weight_sync.xor_delta import (
 )
 
 _CHECKPOINT_WRAPPER_PREFIX = "_checkpoint_wrapped_module."
-_DEFAULT_ADAM_BUCKET_BYTES = 256 * 1024 * 1024
+_DEFAULT_ADAM_BUCKET_BYTES = 512 * 1024 * 1024
 
 
 def _canonical_parameter_name(name: str) -> str:
@@ -36,7 +36,7 @@ class DeltaAdamW(AdamW):
         params: Iterable[tuple[str, nn.Parameter]],
         *,
         delta_adam_bucket_bytes: int = _DEFAULT_ADAM_BUCKET_BYTES,
-        delta_pipeline_depth: int = 2,
+        delta_pipeline_depth: int = 8,
         **kwargs: Any,
     ) -> None:
         if delta_adam_bucket_bytes <= 0:

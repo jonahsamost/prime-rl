@@ -41,6 +41,11 @@ from prime_rl.trainer.rl.broadcast.nixl.graph import (
     plan_tensor_replay,
 )
 from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
+from prime_rl.trainer.rl.broadcast.nixl.notifications import (
+    NIXLNotificationInbox,
+    group_notification,
+    wait_for_notifications,
+)
 from prime_rl.trainer.rl.broadcast.nixl.tensor_routing import TensorRoute, route_sharded_tensor
 from prime_rl.trainer.rl.broadcast.nixl.trainer_tensor_table import TrainerTensor, TrainerTensorTable
 from prime_rl.weight_sync.xor_delta import (
@@ -59,7 +64,6 @@ else:
     Worker = object
 
 logger = init_logger("vllm.inference.vllm.worker_nixl")
-_BUFFER_POLL_INTERVAL = 0.01
 
 
 @dataclass
@@ -184,6 +188,9 @@ class NIXLWeightUpdateWorker(Worker):
         self.delta_codec = NvcompLZ4Codec(self.device) if delta_mode == "xor" else None
         self.delta_peer_metadata: dict[str, bytes] = {}
         self.delta_peer_names: dict[str, str] = {}
+        self.trainer_peer_names: dict[int, str] = {}
+        self.trainer_control_peer_name: str | None = None
+        self.notification_inbox = NIXLNotificationInbox()
         self.delta_receive_arenas: list[torch.Tensor] = []
         self.delta_receive_registrations: list[Any] = []
         self.delta_receive_slot_bytes = 0
@@ -218,20 +225,9 @@ class NIXLWeightUpdateWorker(Worker):
         table = TrainerTensorTable.decode(self.model_express.fetch(trainer_ref).nixl_metadata)
         copies = self.trace_weight_loads(table)
         plan = self.build_transfer_plan(table, copies)
+        self.prepare_trainer_control_peer(table)
         if self.delta_mode == "xor":
             self.validate_delta_transfer_plan(plan)
-        self.buffer_sessions = []
-        for buffer_index in range(table.staging_buffer_count):
-            session = ModelExpressSession(
-                client=self.model_express.client,
-                role="inference",
-                rank=self.model_express.rank,
-                session_id=f"{self.model_express.session_id}:layers:{buffer_index}",
-                worker_id=f"inference-buffer-{self.model_express.rank}-{buffer_index}",
-            )
-            session.publish()
-            session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
-            self.buffer_sessions.append(session)
         # Join the current generation directly. Publishing a transient READY
         # before the first pull would let the trainer mistake initialization
         # for a completed acknowledgement.
@@ -244,6 +240,55 @@ class NIXLWeightUpdateWorker(Worker):
             len(plan.groups),
         )
         return plan
+
+    def prepare_trainer_control_peer(self, table: TrainerTensorTable) -> None:
+        peer_name = self.trainer_peer_names.get(0)
+        if peer_name is None:
+            peer_name = self.nixl_agent.add_remote_agent(table.agents[0].metadata)
+            self.nixl_agent.make_connection(peer_name)
+            self.trainer_peer_names[0] = peer_name
+        self.trainer_control_peer_name = peer_name
+
+    def wait_for_group_ready(
+        self,
+        *,
+        step: int,
+        group_index: int,
+        cancelled: Event,
+    ) -> None:
+        assert self.weight_transfer_plan is not None
+        assert self.trainer_control_peer_name is not None
+        notification = group_notification(
+            session_id=self.model_express.session_id,
+            kind="ready",
+            step=step,
+            group_index=group_index,
+            buffer_index=group_index % self.weight_transfer_plan.table.staging_buffer_count,
+            inference_rank=self.model_express.rank,
+        )
+        wait_for_notifications(
+            self.nixl_agent,
+            self.notification_inbox,
+            {self.trainer_control_peer_name: notification},
+            timeout=self.weight_transfer_timeout,
+            context=f"policy v{step} group {group_index} ready",
+            cancelled=cancelled.is_set,
+        )
+
+    def acknowledge_group(self, *, step: int, group_index: int) -> None:
+        assert self.weight_transfer_plan is not None
+        assert self.trainer_control_peer_name is not None
+        self.nixl_agent.send_notification(
+            self.trainer_control_peer_name,
+            group_notification(
+                session_id=self.model_express.session_id,
+                kind="ack",
+                step=step,
+                group_index=group_index,
+                buffer_index=group_index % self.weight_transfer_plan.table.staging_buffer_count,
+                inference_rank=self.model_express.rank,
+            ).encode(),
+        )
 
     @staticmethod
     def validate_delta_transfer_plan(plan: WeightTransferPlan) -> None:
@@ -505,7 +550,7 @@ class NIXLWeightUpdateWorker(Worker):
                 )
 
         agent_devices = {agent_index: agent.device_id for agent_index, agent in enumerate(table.agents)}
-        peer_names: dict[int, str] = {}
+        peer_names = self.trainer_peer_names
         transfer_groups: list[WeightTransferGroup] = []
 
         for group_index, group in enumerate(table.groups):
@@ -672,7 +717,7 @@ class NIXLWeightUpdateWorker(Worker):
                     )
                 self.apply_delta_manifest(plan, manifest)
             else:
-                self.apply_transfer_plan(plan)
+                self.apply_transfer_plan(plan, step=policy.step)
             update_mla_absorbed_weights(self.raw_model)
             torch.cuda.synchronize(self.device)
         except BaseException:
@@ -788,15 +833,11 @@ class NIXLWeightUpdateWorker(Worker):
         if previous_event is not None:
             previous_event.synchronize()
 
-        session = self.buffer_sessions[group_index % len(self.buffer_sessions)]
         wait_started = time.perf_counter()
-        session.wait_for(
-            "trainer",
-            count=1,
-            status=p2p_pb2.SOURCE_STATUS_READY,
-            timeout=self.weight_transfer_timeout,
-            poll_interval=_BUFFER_POLL_INTERVAL,
-            cancelled=cancelled.is_set,
+        self.wait_for_group_ready(
+            step=manifest.step,
+            group_index=group_index,
+            cancelled=cancelled,
         )
         ready_wait_seconds = time.perf_counter() - wait_started
 
@@ -810,6 +851,10 @@ class NIXLWeightUpdateWorker(Worker):
         )
         pull_seconds = time.perf_counter() - pull_started
 
+        acknowledgement_started = time.perf_counter()
+        self.acknowledge_group(step=manifest.step, group_index=group_index)
+        acknowledgement_seconds = time.perf_counter() - acknowledgement_started
+
         decode_started = torch.cuda.Event(enable_timing=True)
         decode_finished = torch.cuda.Event(enable_timing=True)
         with torch.cuda.stream(self.delta_prefetch_stream):
@@ -817,19 +862,6 @@ class NIXLWeightUpdateWorker(Worker):
             decoded = self.decode_delta_frames(pulled)
             decode_finished.record(self.delta_prefetch_stream)
         slot_events[slot] = decode_finished
-
-        acknowledgement_started = time.perf_counter()
-        session.set_status(p2p_pb2.SOURCE_STATUS_READY)
-        session.wait_for(
-            "trainer",
-            count=1,
-            status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
-            timeout=self.weight_transfer_timeout,
-            poll_interval=_BUFFER_POLL_INTERVAL,
-            cancelled=cancelled.is_set,
-        )
-        session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
-        acknowledgement_seconds = time.perf_counter() - acknowledgement_started
 
         return PreparedDeltaGroup(
             transfer_group=transfer_group,
@@ -1122,7 +1154,7 @@ class NIXLWeightUpdateWorker(Worker):
                 source_bytes.narrow(0, source_offset, route.nbytes)
             )
 
-    def apply_transfer_plan(self, plan: WeightTransferPlan) -> None:
+    def apply_transfer_plan(self, plan: WeightTransferPlan, *, step: int) -> None:
         from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
         from vllm.model_executor.model_loader.reload.layerwise import (
             LAYERWISE_INFO,
@@ -1141,15 +1173,11 @@ class NIXLWeightUpdateWorker(Worker):
 
         def pull_group(group_index: int) -> tuple[WeightTransferGroup, FullGroupMetrics]:
             transfer_group = plan.groups[group_index]
-            session = self.buffer_sessions[group_index % len(self.buffer_sessions)]
             wait_started = time.perf_counter()
-            session.wait_for(
-                "trainer",
-                count=1,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-                timeout=self.weight_transfer_timeout,
-                poll_interval=_BUFFER_POLL_INTERVAL,
-                cancelled=cancelled.is_set,
+            self.wait_for_group_ready(
+                step=step,
+                group_index=group_index,
+                cancelled=cancelled,
             )
             wait_seconds = time.perf_counter() - wait_started
 
@@ -1169,17 +1197,7 @@ class NIXLWeightUpdateWorker(Worker):
 
         def acknowledge_group(group_index: int) -> float:
             started = time.perf_counter()
-            session = self.buffer_sessions[group_index % len(self.buffer_sessions)]
-            session.set_status(p2p_pb2.SOURCE_STATUS_READY)
-            session.wait_for(
-                "trainer",
-                count=1,
-                status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
-                timeout=self.weight_transfer_timeout,
-                poll_interval=_BUFFER_POLL_INTERVAL,
-                cancelled=cancelled.is_set,
-            )
-            session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+            self.acknowledge_group(step=step, group_index=group_index)
             return time.perf_counter() - started
 
         def prefetch_group(group_index: int) -> tuple[WeightTransferGroup, FullGroupMetrics]:

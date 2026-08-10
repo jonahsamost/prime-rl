@@ -124,8 +124,8 @@ def setup_optimizer(
     lora: bool = False,
     cpu_offload: bool = False,
     delta_mode: str = "none",
-    delta_adam_bucket_mb: int = 256,
-    delta_pipeline_depth: int = 2,
+    delta_adam_bucket_mb: int = 512,
+    delta_pipeline_depth: int = 8,
 ) -> Optimizer | CPUOffloadOptimizer:
     if delta_mode != "none" and config.type != "adamw":
         raise ValueError(f"delta mode {delta_mode!r} requires AdamW, got {config.type!r}")
@@ -158,8 +158,8 @@ def _create_optimizer(
     parallel_dims: ParallelDims,
     lr: float | None = None,
     delta_mode: str = "none",
-    delta_adam_bucket_mb: int = 256,
-    delta_pipeline_depth: int = 2,
+    delta_adam_bucket_mb: int = 512,
+    delta_pipeline_depth: int = 8,
 ) -> Optimizer:
     """Create optimizer. If lr is None, uses config.lr."""
     if lr is None:

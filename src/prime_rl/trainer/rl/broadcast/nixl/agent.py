@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import socket
 import time
@@ -11,6 +12,22 @@ from typing import Any, Callable, Sequence
 from torch import Tensor, version
 
 MemDesc = tuple[int, int, int]
+_NOTIFICATION_PREFIX = "prime-rl-msgpack-v1:"
+
+
+def _as_text(value: str | bytes) -> str:
+    return value.decode("utf-8") if isinstance(value, bytes) else value
+
+
+def _encode_notification(message: bytes) -> str:
+    return _NOTIFICATION_PREFIX + base64.b64encode(message).decode("ascii")
+
+
+def _decode_notification(message: str | bytes) -> bytes:
+    encoded = _as_text(message)
+    if not encoded.startswith(_NOTIFICATION_PREFIX):
+        raise ValueError("Received a NIXL notification with an unknown encoding")
+    return base64.b64decode(encoded.removeprefix(_NOTIFICATION_PREFIX), validate=True)
 
 
 def _nixl_api_modules() -> tuple[str, ...]:
@@ -53,10 +70,23 @@ class NixlAgent:
         return self._agent.get_agent_metadata()
 
     def add_remote_agent(self, metadata: bytes) -> str:
-        return self._agent.add_remote_agent(metadata)
+        return _as_text(self._agent.add_remote_agent(metadata))
 
     def make_connection(self, peer_name: str) -> None:
         self._agent.make_connection(peer_name)
+
+    def send_notification(self, peer_name: str, message: bytes) -> None:
+        # NIXL 0.10.1's Python wrapper passes a scalar backend handle to a
+        # binding that expects a sequence. This agent only configures UCX, so
+        # allowing the binding to select its configured backend is unambiguous.
+        self._agent.send_notif(_as_text(peer_name), _encode_notification(message))
+
+    def get_notifications(self) -> dict[str, list[bytes]]:
+        notifications = self._agent.get_new_notifs(backends=["UCX"])
+        return {
+            _as_text(sender): [_decode_notification(message) for message in messages]
+            for sender, messages in notifications.items()
+        }
 
     def prepare_xfer_dlist(self, descs: Sequence[MemDesc], agent_name: str | None = None) -> Any:
         return self._agent.prep_xfer_dlist(

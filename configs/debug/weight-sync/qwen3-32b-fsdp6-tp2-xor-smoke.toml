@@ -64,7 +64,7 @@ type = "nixl"
 host = "127.0.0.1"
 port = 18001
 delta_mode = "xor"
-delta_adam_bucket_mb = 1024
+delta_adam_bucket_mb = 512
 delta_pipeline_depth = 8
 
 [deployment]

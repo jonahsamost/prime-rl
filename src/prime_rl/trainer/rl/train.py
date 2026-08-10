@@ -182,10 +182,10 @@ def train(config: TrainerConfig):
             delta_adam_bucket_mb=(
                 config.weight_broadcast.delta_adam_bucket_mb
                 if config.weight_broadcast.type == "nixl"
-                else 256
+                else 512
             ),
             delta_pipeline_depth=(
-                config.weight_broadcast.delta_pipeline_depth if config.weight_broadcast.type == "nixl" else 2
+                config.weight_broadcast.delta_pipeline_depth if config.weight_broadcast.type == "nixl" else 8
             ),
         )
         scheduler = setup_scheduler(optimizer, config.scheduler, config.max_steps, config.optim.lr)

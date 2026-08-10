@@ -114,8 +114,8 @@ dtype = "bfloat16"
 [weight_broadcast]
 type = "nixl"
 delta_mode = "xor"
-delta_adam_bucket_mb = 256
-delta_pipeline_depth = 2
+delta_adam_bucket_mb = 512
+delta_pipeline_depth = 8
 ```
 
 Use `configs/debug/weight-sync/qwen3-8b-fsdp4-tp2-nixl-xor-smoke.toml` for a
@@ -144,7 +144,13 @@ without leaving CUDA memory. The compressed tensor streams are packed into one
 CUDA `uint8` payload per trainer rank. NIXL copies frames into reusable
 registered arenas on their owning trainer ranks; rank zero publishes metadata
 only, and each inference worker pulls only frames required by its traced TP/EP
-routes. Receivers decode and apply one transfer group at a time.
+routes. Receivers pull and decode the next bounded transfer group on a side
+stream while applying the current group. ModelExpress handles initial peer
+discovery, policy metadata, and policy-level pause/update/resume coordination.
+After discovery, per-group READY and ACK messages use generation-tagged NIXL
+notifications instead of ModelExpress status polling. The generation includes
+the policy step, group index, staging slot, and inference rank so delayed
+notifications cannot authorize reuse of the wrong producer buffer.
 If compression is not beneficial on any trainer rank, all ranks collectively
 fall back to the full-transfer protocol for that policy version; the decision
 must never be made independently because trainer ranks share the same
@@ -158,6 +164,12 @@ Use `127.0.0.1`, rather than an IPv6 wildcard or `localhost`, for single-node
 smoke configs because GPU containers may have IPv6 disabled. Use a dedicated
 high coordinator port such as `18001`; port `8001` is the ModelExpress default
 and may already be occupied by a service supplied by the runtime image.
+
+Before model-level testing, exercise bidirectional NIXL notifications directly:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 uv run pytest tests/integration/test_nixl_notifications.py -q -s
+```
 
 Before a long NIXL smoke run, verify that one installed CUDA-specific binding
 actually exposes the UCX plugin:
@@ -175,6 +187,10 @@ NIXL module, and selects the first one that actually advertises UCX. The
 hosted on the prime-rl v0.5.0 release is missing a usable packaged UCX backend.
 If the probe fails after switching wheel sources, force replacement of the
 same-version installed wheel with `uv sync --refresh-package nixl-cu12`.
+NIXL 0.10.1's notification binding accepts text even though its Python wrapper
+annotates messages as bytes, returns remote agent names as bytes, and mishandles
+an explicitly selected backend. Keep notification encoding and agent-name
+normalization inside `NixlAgent`; callers should exchange raw protocol bytes.
 NIXL defaults `UCX_TLS` to `all`; keep that value in single-node smoke configs
 so CUDA IPC/shared-memory or TCP transports remain available on hosts without
 RDMA devices. An error listing unavailable `rc_x`, `rc`, `dc_x`, and `dc`

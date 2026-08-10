@@ -38,6 +38,11 @@ from prime_rl.trainer.rl.broadcast.nixl.delta_manifest import (
     merge_delta_manifest_fragments,
 )
 from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
+from prime_rl.trainer.rl.broadcast.nixl.notifications import (
+    NIXLNotificationInbox,
+    group_notification,
+    wait_for_notifications,
+)
 from prime_rl.trainer.rl.broadcast.nixl.trainer_tensor_table import (
     TrainerAgent,
     TrainerGroup,
@@ -50,7 +55,6 @@ from prime_rl.trainer.utils import get_world
 from prime_rl.weight_sync.grouping import LAYER_RE
 from prime_rl.weight_sync.xor_delta import NVCOMP_FRAME_ALIGNMENT, DeltaUpdate, align_nvcomp_nbytes
 
-BUFFER_POLL_INTERVAL = 0.01
 MAX_STAGING_BUFFER_COUNT = 8
 
 
@@ -106,6 +110,8 @@ class NIXLWeightBroadcast(WeightBroadcast):
         self.staging_buffer_count: int
         self.trainer_table: TrainerTensorTable | None = None
         self.last_broadcast_step: int | None = None
+        self.inference_notification_peers: dict[int, str] = {}
+        self.notification_inbox = NIXLNotificationInbox()
 
     @property
     def is_serving_rank(self) -> bool:
@@ -388,18 +394,6 @@ class NIXLWeightBroadcast(WeightBroadcast):
             self.trainer_table = table
             server_url = f"{self.config.host}:{self.config.port}"
             client = MxClient(server_url=server_url)
-            self.buffer_sessions = []
-            for buffer_index in range(self.staging_buffer_count):
-                session = ModelExpressSession(
-                    client=client,
-                    role="trainer",
-                    rank=0,
-                    session_id=f"{self.config.session_id}:layers:{buffer_index}",
-                    worker_id=f"trainer-buffer-{buffer_index}",
-                )
-                session.publish()
-                session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
-                self.buffer_sessions.append(session)
             self.model_express = ModelExpressSession(
                 client=client,
                 role="trainer",
@@ -425,23 +419,60 @@ class NIXLWeightBroadcast(WeightBroadcast):
             )
         self.initialized = True
 
-    def finish_staging_buffer_transfer(self, buffer_index: int) -> None:
-        if self.world.is_master:
-            session = self.buffer_sessions[buffer_index]
-            session.wait_for(
-                "inference",
-                count=self.config.inference_world_size,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-                timeout=self.config.timeout,
-                poll_interval=BUFFER_POLL_INTERVAL,
+    def prepare_inference_notification_peers(self) -> None:
+        if not self.world.is_master or self.inference_notification_peers:
+            return
+        refs = self.model_express.wait_for(
+            "inference",
+            count=self.config.inference_world_size,
+            status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+            timeout=self.config.timeout,
+        )
+        for ref in refs:
+            metadata = self.model_express.fetch(ref).nixl_metadata
+            if not metadata:
+                raise RuntimeError(f"inference rank {ref.worker_rank} published no NIXL agent metadata")
+            peer_name = self.nixl_agent.add_remote_agent(metadata)
+            self.nixl_agent.make_connection(peer_name)
+            self.inference_notification_peers[ref.worker_rank] = peer_name
+
+    def publish_group_ready(self, step: int, group_index: int) -> None:
+        if not self.world.is_master:
+            return
+        buffer_index = group_index % self.staging_buffer_count
+        for inference_rank, peer_name in self.inference_notification_peers.items():
+            self.nixl_agent.send_notification(
+                peer_name,
+                group_notification(
+                    session_id=self.config.session_id,
+                    kind="ready",
+                    step=step,
+                    group_index=group_index,
+                    buffer_index=buffer_index,
+                    inference_rank=inference_rank,
+                ).encode(),
             )
-            session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
-            session.wait_for(
-                "inference",
-                count=self.config.inference_world_size,
-                status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+
+    def finish_staging_buffer_transfer(self, step: int, group_index: int) -> None:
+        if self.world.is_master:
+            buffer_index = group_index % self.staging_buffer_count
+            expected = {
+                peer_name: group_notification(
+                    session_id=self.config.session_id,
+                    kind="ack",
+                    step=step,
+                    group_index=group_index,
+                    buffer_index=buffer_index,
+                    inference_rank=inference_rank,
+                )
+                for inference_rank, peer_name in self.inference_notification_peers.items()
+            }
+            wait_for_notifications(
+                self.nixl_agent,
+                self.notification_inbox,
+                expected,
                 timeout=self.config.timeout,
-                poll_interval=BUFFER_POLL_INTERVAL,
+                context=f"policy v{step} group {group_index} acknowledgements",
             )
         dist.barrier()
 
@@ -520,12 +551,13 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
                 timeout=self.config.timeout,
             )
+            self.prepare_inference_notification_peers()
 
         for group, group_name in enumerate(self.transfer_group_names):
             group_start = time.perf_counter()
             buffer_index = group % self.staging_buffer_count
             if group >= self.staging_buffer_count:
-                self.finish_staging_buffer_transfer(buffer_index)
+                self.finish_staging_buffer_transfer(step, group - self.staging_buffer_count)
 
             if self.is_serving_rank:
                 for shard in self.staged_shards_by_group.get(group, ()):
@@ -533,7 +565,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 torch.cuda.synchronize()
             dist.barrier()
             if self.world.is_master:
-                self.buffer_sessions[buffer_index].set_status(p2p_pb2.SOURCE_STATUS_READY)
+                self.publish_group_ready(step, group)
                 self.logger.debug(
                     f"NIXL+ModelExpress policy v{step} group {group_name} staged in buffer {buffer_index} in "
                     f"{time.perf_counter() - group_start:.2f}s"
@@ -541,8 +573,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
 
         first_pending_group = max(0, len(self.transfer_group_names) - self.staging_buffer_count)
         for group in range(first_pending_group, len(self.transfer_group_names)):
-            buffer_index = group % self.staging_buffer_count
-            self.finish_staging_buffer_transfer(buffer_index)
+            self.finish_staging_buffer_transfer(step, group)
 
         self.finish_policy_transfer()
         self.last_broadcast_step = step
@@ -687,23 +718,24 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
                 timeout=self.config.timeout,
             )
+            self.prepare_inference_notification_peers()
 
         for group_index, group_name in enumerate(self.transfer_group_names):
             buffer_index = group_index % self.staging_buffer_count
             if group_index >= self.staging_buffer_count:
-                self.finish_staging_buffer_transfer(buffer_index)
+                self.finish_staging_buffer_transfer(step, group_index - self.staging_buffer_count)
             if self.is_serving_rank:
                 for destination, source in self.delta_group_copies[group_index]:
                     destination.copy_(source)
                 torch.cuda.synchronize()
             dist.barrier()
             if self.world.is_master:
-                self.buffer_sessions[buffer_index].set_status(p2p_pb2.SOURCE_STATUS_READY)
+                self.publish_group_ready(step, group_index)
                 self.logger.debug(f"NIXL XOR policy v{step} group {group_name} ready in buffer {buffer_index}")
 
         first_pending_group = max(0, len(self.transfer_group_names) - self.staging_buffer_count)
         for group_index in range(first_pending_group, len(self.transfer_group_names)):
-            self.finish_staging_buffer_transfer(group_index % self.staging_buffer_count)
+            self.finish_staging_buffer_transfer(step, group_index)
 
         self.finish_policy_transfer()
         self.last_broadcast_step = step
