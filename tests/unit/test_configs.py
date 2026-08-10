@@ -540,14 +540,13 @@ def test_shared_and_subconfig_disjoint_fields_coexist():
     assert config.trainer.model.impl == "custom"
 
 
-@pytest.mark.parametrize("transport", ["nccl", "nixl"])
 @pytest.mark.parametrize("dtype", ["bfloat16", "float16", "float32"])
-def test_xor_weight_transfer_propagates_to_in_memory_components(transport, dtype):
+def test_xor_weight_transfer_propagates_to_nixl_components(dtype):
     config = RLConfig.model_validate(
         {
             "model": {"name": "Qwen/Qwen3-0.6B-Base"},
             "weight_broadcast": {
-                "type": transport,
+                "type": "nixl",
                 "delta_mode": "xor",
                 "delta_adam_bucket_mb": 192,
                 "delta_pipeline_depth": 3,
@@ -558,14 +557,24 @@ def test_xor_weight_transfer_propagates_to_in_memory_components(transport, dtype
         }
     )
 
-    assert config.trainer.weight_broadcast.type == transport
+    assert config.trainer.weight_broadcast.type == "nixl"
     assert config.trainer.weight_broadcast.delta_mode == "xor"
     assert config.trainer.weight_broadcast.delta_adam_bucket_mb == 192
     assert config.trainer.weight_broadcast.delta_pipeline_depth == 3
-    assert config.orchestrator.weight_broadcast.type == transport
+    assert config.orchestrator.weight_broadcast.type == "nixl"
     assert config.orchestrator.weight_broadcast.delta_mode == "xor"
     assert config.orchestrator.weight_broadcast.delta_adam_bucket_mb == 192
     assert config.orchestrator.weight_broadcast.delta_pipeline_depth == 3
+
+
+def test_nccl_weight_transfer_rejects_xor_configuration():
+    with pytest.raises(ValidationError, match="delta_mode"):
+        RLConfig.model_validate(
+            {
+                "weight_broadcast": {"type": "nccl", "delta_mode": "xor"},
+                "orchestrator": {"renderer": {"name": "default"}},
+            }
+        )
 
 
 def test_xor_weight_transfer_rejects_quantization():
@@ -573,7 +582,7 @@ def test_xor_weight_transfer_rejects_quantization():
         RLConfig.model_validate(
             {
                 "model": {"name": "Qwen/Qwen3-0.6B-Base"},
-                "weight_broadcast": {"type": "nccl", "delta_mode": "xor"},
+                "weight_broadcast": {"type": "nixl", "delta_mode": "xor"},
                 "trainer": {
                     "model": {
                         "optimization_dtype": "bfloat16",
@@ -595,7 +604,7 @@ def test_xor_weight_transfer_rejects_mismatched_inference_dtype(trainer_dtype, i
         RLConfig.model_validate(
             {
                 "model": {"name": "meta-llama/Llama-3.2-1B"},
-                "weight_broadcast": {"type": "nccl", "delta_mode": "xor"},
+                "weight_broadcast": {"type": "nixl", "delta_mode": "xor"},
                 "trainer": {"model": {"optimization_dtype": trainer_dtype}},
                 "orchestrator": {"renderer": {"name": "default"}},
                 "inference": {"model": {"dtype": inference_dtype}, "parallel": {"tp": 1}},

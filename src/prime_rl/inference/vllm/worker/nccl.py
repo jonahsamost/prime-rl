@@ -1,5 +1,4 @@
 import pickle
-import time
 from typing import TYPE_CHECKING, Generator, cast
 
 import torch
@@ -8,19 +7,12 @@ from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.logger import init_logger
 
-from prime_rl.inference.vllm.worker.dense_xor import validate_dense_delta_model
-from prime_rl.inference.vllm.worker.nccl_delta import NCCLDeltaHandler
 from prime_rl.inference.vllm.worker.weight_transfer import (
     load_weights_checkpoint_layerwise,
     load_weights_kernel,
     update_mla_absorbed_weights,
 )
 from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
-from prime_rl.weight_sync.xor_delta import (
-    WeightUpdateHeader,
-    WeightUpdateKind,
-    decode_weight_update_header,
-)
 
 # This is to get type hints for the Worker class but not actually extend it at runtime as this is required by vLLM worker extension
 if TYPE_CHECKING:
@@ -47,27 +39,6 @@ def receive_integer(
     integer_tensor = torch.tensor([10], dtype=torch.long).to(communicator.device)
     _receive_tensor(integer_tensor, communicator)
     return cast(int, integer_tensor.item())
-
-
-def receive_update_header(
-    communicator: PyNcclCommunicator,
-) -> WeightUpdateHeader:
-    values = torch.empty(5, dtype=torch.long, device=communicator.device)
-    _receive_tensor(values, communicator)
-    try:
-        return decode_weight_update_header(values)
-    except ValueError as error:
-        raise RuntimeError(str(error)) from error
-
-
-def receive_bytes(
-    communicator: PyNcclCommunicator,
-) -> bytes:
-    size = receive_integer(communicator)
-    values = torch.empty(size, dtype=torch.uint8, device=communicator.device)
-    _receive_tensor(values, communicator)
-    cpu_values = values.cpu()
-    return cpu_values.numpy().tobytes()
 
 
 def receive_state_dict(
@@ -111,16 +82,12 @@ class NCCLWeightBroadcastReceiver:
         world_size: int,
         device: int | str | torch.device,
         timeout: int,
-        delta_mode: str = "none",
     ):
         logger.info(f"Initializing NCCL broadcast receiver ({host}:{port}, rank={rank}, world_size={world_size})")
         disable_nccl_p2p_if_unavailable()
 
         pg = StatelessProcessGroup.create(host=host, port=port, rank=rank, world_size=world_size, store_timeout=timeout)
         self.communicator = PyNcclCommunicator(pg, device=device)
-        self.delta_mode = delta_mode
-        self.current_step: int | None = None
-        self.delta_handler = NCCLDeltaHandler(device) if delta_mode == "xor" else None
 
     @torch.no_grad()
     def receive_state_dict(self):
@@ -132,28 +99,6 @@ class NCCLWeightBroadcastReceiver:
             logger.info(f"Receiving state dict {layer_id + 1}/{num_state_dict_to_receive}")
             for key, value in receive_state_dict(self.communicator):
                 yield key, value
-
-    def receive_update_header(self) -> WeightUpdateHeader | None:
-        return receive_update_header(self.communicator)
-
-
-def _finish_weight_update(
-    receiver: NCCLWeightBroadcastReceiver,
-    header: WeightUpdateHeader | None,
-    device: torch.device,
-) -> None:
-    """Wait for application, report end-to-end latency, and advance the resident policy version."""
-    torch.cuda.synchronize(device)
-    if header is None:
-        return
-    if header.optimizer_start_ns:
-        optimizer_to_apply_ms = (time.perf_counter_ns() - header.optimizer_start_ns) / 1_000_000
-        logger.info(
-            "Policy v%d optimizer-start to inference-apply: %.2f ms",
-            header.step,
-            optimizer_to_apply_ms,
-        )
-    receiver.current_step = header.step
 
 
 class NCCLWeightUpdateWorker(Worker):
@@ -168,7 +113,6 @@ class NCCLWeightUpdateWorker(Worker):
         timeout: int,
         quantize_in_weight_transfer: bool = False,
         session_id: str = "default",
-        delta_mode: str = "none",
     ) -> None:
         """Initialize the NCCL broadcast receiver.
 
@@ -178,21 +122,7 @@ class NCCLWeightUpdateWorker(Worker):
         """
         del session_id
         self.quantize_in_weight_transfer = quantize_in_weight_transfer
-        self.delta_mode = delta_mode
-        if self.delta_mode != "none" and self.quantize_in_weight_transfer:
-            raise ValueError("XOR delta mode is incompatible with quantize_in_weight_transfer")
-        if self.delta_mode == "xor":
-            model = self.model_runner.model
-            if hasattr(model, "runnable"):
-                model = model.runnable
-            assert isinstance(model, Module)
-            self.delta_model_dtype = validate_dense_delta_model(model)
-        else:
-            self.delta_model_dtype = None
-        # Use the worker's device index directly as the local rank.
-        # The previous dp_group-based computation broke in vLLM v1 multiprocess
-        # DP mode where each worker is a separate process with a singleton
-        # DP group (rank_in_group is always 0).
+        # Each vLLM worker owns its assigned CUDA device, including singleton DP groups.
         local_rank = self.device.index
         global_rank_inference = rank_offset + local_rank
 
@@ -208,7 +138,6 @@ class NCCLWeightUpdateWorker(Worker):
             world_size=inference_world_size + 1,  # +1 as the trainer broadcaster is on rank 0
             device=self.device,
             timeout=timeout,
-            delta_mode=delta_mode,
         )
 
     def liveness_probe(self) -> None:
@@ -224,36 +153,15 @@ class NCCLWeightUpdateWorker(Worker):
             model = model_runner.model
         assert isinstance(model, Module)
 
-        del weight_dir
-        header = self.nccl_broadcast_receiver.receive_update_header()
-        if header is not None and header.kind == WeightUpdateKind.XOR:
-            if header.base_step != self.nccl_broadcast_receiver.current_step:
-                raise RuntimeError(
-                    f"cannot apply XOR delta for step {header.step}: base step {header.base_step} "
-                    f"does not match resident step {self.nccl_broadcast_receiver.current_step}"
-                )
-            delta_handler = self.nccl_broadcast_receiver.delta_handler
-            assert delta_handler is not None
-            assert self.delta_model_dtype is not None
-            delta_handler.receive_and_apply(
-                model,
-                self.nccl_broadcast_receiver.communicator,
-                header,
-                model_dtype=self.delta_model_dtype,
-                receive_tensor=_receive_tensor,
-                receive_bytes=receive_bytes,
-            )
-        else:
-            state_iter = self.nccl_broadcast_receiver.receive_state_dict()
-            if self.quantize_in_weight_transfer:
-                load_weights_kernel(model, state_iter)
-                update_mla_absorbed_weights(model)
-            else:
-                load_weights_checkpoint_layerwise(
-                    model,
-                    state_iter,
-                    self.model_runner.model_config,
-                    self.vllm_config,
-                )
+        state_iter = self.nccl_broadcast_receiver.receive_state_dict()
+        if self.quantize_in_weight_transfer:
+            load_weights_kernel(model, state_iter)
+            update_mla_absorbed_weights(model)
+            return
 
-        _finish_weight_update(self.nccl_broadcast_receiver, header, self.device)
+        load_weights_checkpoint_layerwise(
+            model,
+            state_iter,
+            self.model_runner.model_config,
+            self.vllm_config,
+        )

@@ -18,7 +18,6 @@ from prime_rl.trainer.weights import (
 )
 from prime_rl.trainer.world import get_world
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
-from prime_rl.weight_sync.xor_delta import DeltaUpdate
 
 
 class FileSystemWeightBroadcast(WeightBroadcast):
@@ -36,10 +35,8 @@ class FileSystemWeightBroadcast(WeightBroadcast):
             f"Filesystem broadcast initialized (save_format={config.save_format}, save_sharded={self.save_sharded})"
         )
 
-    def broadcast_weights(self, model: nn.Module, step: int, delta_update: DeltaUpdate | None = None) -> None:
+    def broadcast_weights(self, model: nn.Module, step: int) -> None:
         """Save a HF-compatible checkpoint and notify the orchestrator."""
-        if delta_update is not None:
-            raise ValueError("filesystem weight broadcast does not support XOR delta updates")
         self.logger.debug("Starting broadcasting weights to inference engine via shared filesystem")
         start_time = time.perf_counter()
         adapter_only = self.lora_config is not None

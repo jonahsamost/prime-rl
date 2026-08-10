@@ -98,8 +98,8 @@ Leave it unset for normal training. When enabled, it exports every sequence from
 
 ## Experimental XOR weight transfer
 
-The NCCL and NIXL broadcasters have an opt-in GPU-resident nvCOMP LZ4 path for
-exact bitwise XOR updates in BF16, FP16, or FP32:
+The NIXL broadcaster has an opt-in GPU-resident nvCOMP LZ4 path for exact
+bitwise XOR updates in BF16, FP16, or FP32:
 
 ```toml
 [model]
@@ -133,19 +133,18 @@ Trainer `optimization_dtype` and inference `model.dtype` must be the same
 explicit value: `bfloat16`, `float16`, or `float32`. Model loaders must route
 weights through same-dtype, bit-preserving operations; the NIXL worker validates
 the traced load graph before the first update. NIXL supports rank-aware TP/EP
-pulls and multi-node deployment. NCCL XOR remains limited to `ep=1`,
-single-node runs. Fake-data runs skip weight transfer and use standard AdamW
-even when delta mode is configured.
+pulls and multi-node deployment. NCCL remains available for normal full-weight
+transfer but does not implement XOR updates. Fake-data runs skip weight
+transfer and use standard AdamW even when delta mode is configured.
 The startup update is a normal full checkpoint transfer;
 later consecutive versions are source-layout XOR updates. AdamW snapshots and
 updates bounded local parameter buckets, invokes one foreach-capable AdamW update per
 bucket, and batch-compresses that bucket's parameter XOR tensors with nvCOMP LZ4
 without leaving CUDA memory. The compressed tensor streams are packed into one
-CUDA `uint8` payload per trainer rank. NCCL gathers these payloads for collective
-broadcast. NIXL copies frames into reusable registered arenas on their owning
-trainer ranks; rank zero publishes metadata only, and each inference worker
-pulls only frames required by its traced TP/EP routes. Receivers decode and
-apply one transfer group at a time.
+CUDA `uint8` payload per trainer rank. NIXL copies frames into reusable
+registered arenas on their owning trainer ranks; rank zero publishes metadata
+only, and each inference worker pulls only frames required by its traced TP/EP
+routes. Receivers decode and apply one transfer group at a time.
 If compression is not beneficial on any trainer rank, all ranks collectively
 fall back to the full-transfer protocol for that policy version; the decision
 must never be made independently because trainer ranks share the same

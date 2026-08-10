@@ -5,7 +5,6 @@ import torch.nn as nn
 
 from prime_rl.configs.trainer import LoRAConfig
 from prime_rl.utils.logger import get_logger
-from prime_rl.weight_sync.xor_delta import DeltaUpdate
 
 
 class WeightBroadcast(ABC):
@@ -15,5 +14,5 @@ class WeightBroadcast(ABC):
         self.lora_config = lora_config
 
     @abstractmethod
-    def broadcast_weights(self, model: nn.Module, step: int, delta_update: DeltaUpdate | None = None) -> None:
+    def broadcast_weights(self, model: nn.Module, step: int) -> None:
         raise NotImplementedError

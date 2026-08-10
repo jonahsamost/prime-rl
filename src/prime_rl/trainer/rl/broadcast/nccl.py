@@ -15,10 +15,6 @@ from prime_rl.configs.trainer import NCCLWeightBroadcastConfig
 from prime_rl.trainer.conversion_utils import get_max_layer_num
 from prime_rl.trainer.models import PreTrainedModelPrimeRL
 from prime_rl.trainer.rl.broadcast.base import WeightBroadcast
-from prime_rl.trainer.rl.broadcast.nccl_delta import (
-    broadcast_compressed_delta,
-    gather_compressed_delta_updates,
-)
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.utils import get_world
 from prime_rl.utils.client import NCCL_READY_MARKER
@@ -27,13 +23,6 @@ from prime_rl.utils.nccl import disable_nccl_p2p_if_unavailable
 from prime_rl.utils.pathing import sync_wait_for_path
 from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 from prime_rl.utils.vlm import get_layer_prefix
-from prime_rl.weight_sync.xor_delta import (
-    DeltaUpdate,
-    ShardedDeltaUpdate,
-    WeightUpdateHeader,
-    WeightUpdateKind,
-    encode_weight_update_header,
-)
 
 
 def broadcast_integer(
@@ -43,14 +32,6 @@ def broadcast_integer(
     """Broadcast an integer to a process group using NCCL communicator."""
     integer_tensor = torch.tensor([integer], dtype=torch.long).cuda()
     _broadcast_tensor(integer_tensor, communicator)
-
-
-def broadcast_update_header(
-    header: WeightUpdateHeader,
-    communicator: PyNcclCommunicator,
-) -> None:
-    values = encode_weight_update_header(header, device=communicator.device)
-    _broadcast_tensor(values, communicator)
 
 
 def _broadcast_tensor(
@@ -66,16 +47,6 @@ def _stage_bytes(
 ) -> Tensor:
     values = torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(communicator.device)
     return values
-
-
-def broadcast_bytes(
-    payload: bytes,
-    communicator: PyNcclCommunicator,
-) -> None:
-    size = torch.tensor([len(payload)], dtype=torch.long, device=communicator.device)
-    _broadcast_tensor(size, communicator)
-    values = _stage_bytes(payload, communicator)
-    _broadcast_tensor(values, communicator)
 
 
 def broadcast_state_dict(
@@ -170,17 +141,11 @@ class NCCLWeightBroadcastSender:
         timeout: int,
         dtype: torch.dtype = torch.bfloat16,
         quantize_in_weight_transfer: bool = False,
-        delta_mode: str = "none",
     ):
         self.logger = get_logger()
         self.world = get_world()
         self.dtype = dtype
         self.quantize_in_weight_transfer = quantize_in_weight_transfer
-        self.delta_mode = delta_mode
-        self.last_broadcast_step: int | None = None
-        self._optimizer_start_ns = 0
-        if self.delta_mode != "none" and self.quantize_in_weight_transfer:
-            raise ValueError("XOR delta mode is incompatible with quantize_in_weight_transfer")
 
         if self.world.is_master:
             disable_nccl_p2p_if_unavailable()
@@ -194,65 +159,9 @@ class NCCLWeightBroadcastSender:
             self.logger.debug("NCCL broadcast initialized on non-master rank (no communicator)")
 
     @torch.no_grad()
-    def broadcast_weights(
-        self,
-        model: nn.Module,
-        step: int,
-        delta_update: DeltaUpdate | None = None,
-    ) -> None:
+    def broadcast_weights(self, model: nn.Module, step: int) -> None:
         """Broadcast the state dict of a model into the inference pool using NCCL."""
-        self._broadcast_weights(model, step, delta_update)
-        self._optimizer_start_ns = 0
-
-    def set_optimizer_start_ns(self, optimizer_start_ns: int) -> None:
-        if optimizer_start_ns <= 0:
-            raise ValueError(f"optimizer_start_ns must be positive, got {optimizer_start_ns}")
-        self._optimizer_start_ns = optimizer_start_ns
-
-    def _broadcast_weights(
-        self,
-        model: nn.Module,
-        step: int,
-        delta_update: DeltaUpdate | None,
-    ) -> None:
-        sharded_delta: ShardedDeltaUpdate | None = None
-        is_delta_update = False
-        if self.delta_mode == "xor":
-            sharded_delta, is_delta_update = gather_compressed_delta_updates(delta_update)
-        if is_delta_update:
-            assert delta_update is not None
-            if self.delta_mode != "xor":
-                raise ValueError("received an XOR delta update while delta mode is disabled")
-            if delta_update.step != step:
-                raise ValueError(f"delta step {delta_update.step} does not match broadcast step {step}")
-            if delta_update.base_step != self.last_broadcast_step:
-                raise ValueError(
-                    f"delta base step {delta_update.base_step} does not match last broadcast {self.last_broadcast_step}"
-                )
-            header = WeightUpdateHeader(
-                WeightUpdateKind.XOR,
-                delta_update.base_step,
-                step,
-                self._optimizer_start_ns,
-            )
-        else:
-            header = WeightUpdateHeader(WeightUpdateKind.FULL, -1, step, self._optimizer_start_ns)
-            state_dict = model.state_dict()
-
-        if self.world.is_master:
-            broadcast_update_header(header, self.communicator)
-
-        if is_delta_update:
-            if self.world.is_master:
-                assert sharded_delta is not None
-                broadcast_compressed_delta(
-                    sharded_delta,
-                    self.communicator,
-                    broadcast_tensor=_broadcast_tensor,
-                    broadcast_bytes=broadcast_bytes,
-                )
-            self.last_broadcast_step = step
-            return
+        state_dict = model.state_dict()
 
         layer_prefix = get_layer_prefix(model.config)
         num_layers = get_max_layer_num(state_dict, layer_prefix)
@@ -273,7 +182,6 @@ class NCCLWeightBroadcastSender:
             layer_state_dict = preprocess_fn(model, layer_state_dict, layer_id)
             if self.world.is_master:
                 broadcast_state_dict(layer_state_dict, self.communicator)
-        self.last_broadcast_step = step
 
     def _resolve_dtensors(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
         for key, value in list(state_dict.items()):
@@ -305,16 +213,10 @@ class NCCLWeightBroadcast(WeightBroadcast):
             config.timeout,
             dtype,
             quantize_in_weight_transfer=config.quantize_in_weight_transfer,
-            delta_mode=config.delta_mode,
         )
 
     @torch.no_grad()
-    def broadcast_weights(
-        self,
-        model: nn.Module,
-        step: int,
-        delta_update: DeltaUpdate | None = None,
-    ) -> None:
+    def broadcast_weights(self, model: nn.Module, step: int) -> None:
         """Broadcast the state dict of a model into the inference pool using NCCL and notifies the orchestrator."""
         self.logger.debug("Starting broadcasting weights to inference engine via NCCL")
         start_time = time.perf_counter()
@@ -332,7 +234,7 @@ class NCCLWeightBroadcast(WeightBroadcast):
             self._wait_for_nccl_ready(notified_runs)
         if self.world.world_size > 1:
             dist.barrier()
-        self.nccl_broadcast_sender.broadcast_weights(model, step, delta_update)
+        self.nccl_broadcast_sender.broadcast_weights(model, step)
         self.logger.debug(f"Weights broadcasted in {time.perf_counter() - start_time:.2f}s")
 
     def _compute_notified_runs(self) -> list[tuple[int, Path]]:

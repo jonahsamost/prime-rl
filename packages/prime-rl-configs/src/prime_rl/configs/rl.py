@@ -138,18 +138,6 @@ class SharedNCCLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
     quantize_in_weight_transfer: bool = False
     """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
 
-    delta_mode: Literal["none", "xor"] = "none"
-    """Experimental GPU nvCOMP LZ4 XOR updates over NCCL."""
-
-    delta_adam_bucket_mb: int = Field(256, ge=1)
-    """Maximum local parameter MiB updated by each batched AdamW call.
-
-    An individually larger parameter stands alone.
-    """
-
-    delta_pipeline_depth: int = Field(2, ge=1)
-    """Maximum number of nvCOMP encode batches in flight."""
-
 
 class SharedNIXLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
     type: Literal["nixl"] = "nixl"
@@ -372,18 +360,10 @@ class RLConfig(BaseConfig):
 
     @model_validator(mode="after")
     def validate_xor_weight_transfer(self):
-        if not isinstance(
-            self.weight_broadcast,
-            SharedNCCLWeightBroadcastConfig | SharedNIXLWeightBroadcastConfig,
-        ):
+        if not isinstance(self.weight_broadcast, SharedNIXLWeightBroadcastConfig):
             return self
         if self.weight_broadcast.delta_mode == "none":
             return self
-        if (
-            isinstance(self.weight_broadcast, SharedNCCLWeightBroadcastConfig)
-            and self.weight_broadcast.quantize_in_weight_transfer
-        ):
-            raise ValueError("weight_broadcast.delta_mode='xor' is incompatible with quantized transfer.")
         if self.inference is None:
             raise ValueError("weight_broadcast.delta_mode='xor' requires an inference config.")
         if self.model is None or self.model.vlm is not None:
@@ -403,11 +383,6 @@ class RLConfig(BaseConfig):
             raise ValueError(
                 "weight_broadcast.delta_mode='xor' currently requires trainer.model.dp_replicate=1 and cp=1."
             )
-        if isinstance(self.weight_broadcast, SharedNCCLWeightBroadcastConfig):
-            if self.trainer.model.ep not in ("auto", 1):
-                raise ValueError("NCCL weight_broadcast.delta_mode='xor' does not support expert parallelism.")
-            if self.deployment.type != "single_node":
-                raise ValueError("NCCL weight_broadcast.delta_mode='xor' requires a single-node deployment.")
         return self
 
     ### Auto-setup shared configs (before sub-config construction)
@@ -464,9 +439,6 @@ class RLConfig(BaseConfig):
             if self.weight_broadcast.type == "nccl":
                 transport_config = dict(
                     quantize_in_weight_transfer=self.weight_broadcast.quantize_in_weight_transfer,
-                    delta_mode=self.weight_broadcast.delta_mode,
-                    delta_adam_bucket_mb=self.weight_broadcast.delta_adam_bucket_mb,
-                    delta_pipeline_depth=self.weight_broadcast.delta_pipeline_depth,
                 )
                 trainer_config_type = TrainerNCCLWeightBroadcastConfig
                 orchestrator_config_type = OrchestratorNCCLWeightBroadcastConfig

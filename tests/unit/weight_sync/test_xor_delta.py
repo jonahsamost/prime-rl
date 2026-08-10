@@ -8,17 +8,10 @@ from prime_rl.trainer.delta_adamw import DeltaAdamW
 from prime_rl.weight_sync.xor_delta import (
     DeltaEncoder,
     NvcompLZ4Codec,
-    ShardedDeltaUpdate,
-    WeightUpdateHeader,
-    WeightUpdateKind,
     decode_delta_tensors,
-    decode_weight_update_header,
     delta_dtype_nbytes,
-    encode_weight_update_header,
     integer_view,
     packed_delta_nbytes,
-    reconstruct_delta_tensors,
-    validate_sharded_delta_update,
 )
 
 pytestmark = [pytest.mark.gpu]
@@ -93,131 +86,6 @@ def test_nvcomp_lz4_cuda_encode_decode_round_trip_is_byte_exact(dtype):
     assert torch.equal(torch.bitwise_xor(_bits(old), _bits(decoded["weight"])), _bits(new))
 
 
-def test_four_compressed_dimension_zero_shards_reconstruct_byte_exactly():
-    device = torch.device("cuda", torch.cuda.current_device())
-    full = torch.arange(80, dtype=torch.int16, device=device).view(10, 8).view(torch.bfloat16)
-    local_rows = (3, 3, 2, 2)
-    updates = []
-    offset = 0
-    for shard_index, rows in enumerate(local_rows):
-        value = full.narrow(0, offset, rows).clone()
-        encoder = DeltaEncoder(
-            base_step=8,
-            step=9,
-            codec=NvcompLZ4Codec(device),
-        )
-        encoder.append_sharded_bucket(
-            [("weight", value)],
-            value.reshape(-1),
-            global_shapes=[tuple(full.shape)],
-            shard_dim=0,
-            shard_index=shard_index,
-            shard_count=4,
-        )
-        updates.append(encoder.finish())
-        offset += rows
-
-    distributed = ShardedDeltaUpdate(base_step=8, step=9, shards=tuple(updates))
-    validate_sharded_delta_update(distributed)
-    decoded_shards = []
-    metadata_shards = []
-    for update in distributed.shards:
-        codec = NvcompLZ4Codec(device)
-        decoded = decode_delta_tensors(
-            codec,
-            update.tensors,
-            update.frames,
-            list(update.frame_payloads()),
-        )
-        codec.synchronize()
-        decoded_shards.append(decoded)
-        metadata_shards.append(update.tensors)
-    reconstructed = dict(reconstruct_delta_tensors(decoded_shards, metadata_shards))
-
-    assert torch.equal(_bits(reconstructed["weight"]), _bits(full))
-
-
-def test_distributed_delta_rejects_a_missing_trainer_shard():
-    device = torch.device("cuda", torch.cuda.current_device())
-    updates = []
-    for shard_index in range(3):
-        value = torch.zeros((2, 4), dtype=torch.bfloat16, device=device)
-        encoder = DeltaEncoder(base_step=1, step=2, codec=NvcompLZ4Codec(device))
-        encoder.append_sharded_bucket(
-            [("weight", value)],
-            value.reshape(-1),
-            global_shapes=[(8, 4)],
-            shard_dim=0,
-            shard_index=shard_index,
-            shard_count=4,
-        )
-        updates.append(encoder.finish())
-
-    with pytest.raises(ValueError, match="expected 0/3|expected 1/3|expected 2/3"):
-        validate_sharded_delta_update(ShardedDeltaUpdate(base_step=1, step=2, shards=tuple(updates)))
-
-
-def test_distributed_delta_rejects_divergent_frame_manifests():
-    device = torch.device("cuda", torch.cuda.current_device())
-    updates = []
-    for shard_index in range(2):
-        values = [
-            ("first", torch.zeros((2, 4), dtype=torch.bfloat16, device=device)),
-            ("second", torch.ones((2, 4), dtype=torch.bfloat16, device=device)),
-        ]
-        encoder = DeltaEncoder(base_step=3, step=4, codec=NvcompLZ4Codec(device))
-        if shard_index == 0:
-            bucket = torch.cat([value.reshape(-1) for _, value in values])
-            bucket_values = [
-                ("first", bucket[:8].view(2, 4)),
-                ("second", bucket[8:].view(2, 4)),
-            ]
-            encoder.append_sharded_bucket(
-                bucket_values,
-                bucket,
-                global_shapes=[(4, 4), (4, 4)],
-                shard_dim=0,
-                shard_index=shard_index,
-                shard_count=2,
-            )
-        else:
-            for name, value in values:
-                encoder.append_sharded_bucket(
-                    [(name, value)],
-                    value.reshape(-1),
-                    global_shapes=[(4, 4)],
-                    shard_dim=0,
-                    shard_index=shard_index,
-                    shard_count=2,
-                )
-        updates.append(encoder.finish())
-
-    with pytest.raises(ValueError, match="incompatible tensor/frame manifest"):
-        validate_sharded_delta_update(ShardedDeltaUpdate(base_step=3, step=4, shards=tuple(updates)))
-
-
-def test_distributed_delta_supports_repeated_unsharded_metadata():
-    device = torch.device("cuda", torch.cuda.current_device())
-    value = torch.arange(16, dtype=torch.int16, device=device).view(4, 4).view(torch.bfloat16)
-    updates = []
-    decoded_shards = []
-    metadata_shards = []
-    for _rank in range(4):
-        local = value.clone()
-        encoder = DeltaEncoder(base_step=6, step=7, codec=NvcompLZ4Codec(device))
-        encoder.append_sharded_bucket([("weight", local)], local.reshape(-1))
-        update = encoder.finish()
-        updates.append(update)
-        decoded_shards.append(list(_decode_update(update).items()))
-        metadata_shards.append(update.tensors)
-
-    distributed = ShardedDeltaUpdate(base_step=6, step=7, shards=tuple(updates))
-    validate_sharded_delta_update(distributed)
-    reconstructed = dict(reconstruct_delta_tensors(decoded_shards, metadata_shards))
-
-    assert torch.equal(_bits(reconstructed["weight"]), _bits(value))
-
-
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 def test_delta_adamw_matches_adamw_and_emits_exact_parameter_xor(dtype):
     device = torch.device("cuda", torch.cuda.current_device())
@@ -290,46 +158,3 @@ def test_encoder_rejects_unsupported_dtype_and_nonconsecutive_steps():
 
     with pytest.raises(ValueError, match="requires CUDA tensors"):
         encoder.append("weight", torch.zeros(2, dtype=torch.bfloat16))
-
-
-@pytest.mark.parametrize(
-    "header",
-    [
-        WeightUpdateHeader(WeightUpdateKind.FULL, base_step=-1, step=7, optimizer_start_ns=123456789),
-        WeightUpdateHeader(WeightUpdateKind.XOR, base_step=7, step=8, optimizer_start_ns=123456789),
-    ],
-)
-def test_update_header_round_trip(header: WeightUpdateHeader):
-    encoded = encode_weight_update_header(header, device="cpu")
-
-    assert decode_weight_update_header(encoded) == header
-
-
-def test_update_header_rejects_malformed_or_nonconsecutive_values():
-    with pytest.raises(ValueError, match="optimizer_start_ns must be non-negative"):
-        encode_weight_update_header(
-            WeightUpdateHeader(WeightUpdateKind.FULL, base_step=-1, step=2, optimizer_start_ns=-1),
-            device="cpu",
-        )
-
-    with pytest.raises(ValueError, match="consecutive versions"):
-        encode_weight_update_header(
-            WeightUpdateHeader(WeightUpdateKind.XOR, base_step=2, step=4),
-            device="cpu",
-        )
-
-    encoded = encode_weight_update_header(
-        WeightUpdateHeader(WeightUpdateKind.FULL, base_step=-1, step=2),
-        device="cpu",
-    )
-    encoded[0] = 0
-    with pytest.raises(ValueError, match="protocol magic"):
-        decode_weight_update_header(encoded)
-
-    encoded = encode_weight_update_header(
-        WeightUpdateHeader(WeightUpdateKind.FULL, base_step=-1, step=2),
-        device="cpu",
-    )
-    encoded[1] = 99
-    with pytest.raises(ValueError, match="weight update kind"):
-        decode_weight_update_header(encoded)

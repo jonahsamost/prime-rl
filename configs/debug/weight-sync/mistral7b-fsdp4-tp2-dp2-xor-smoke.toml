@@ -1,6 +1,9 @@
 max_steps = 6
 seq_len = 256
 
+[env_vars]
+UCX_TLS = "all"
+
 [model]
 name = "mistralai/Mistral-7B-Instruct-v0.3"
 
@@ -56,7 +59,9 @@ tp = 2
 dp = 2
 
 [weight_broadcast]
-type = "nccl"
+type = "nixl"
+host = "127.0.0.1"
+port = 18001
 delta_mode = "xor"
 delta_adam_bucket_mb = 256
 delta_pipeline_depth = 2

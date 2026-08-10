@@ -15,10 +15,9 @@ def setup_weight_broadcast(
     config: WeightBroadcastConfig,
     parallel_dims: ParallelDims,
     lora_config: LoRAConfig | None = None,
-    dtype: torch.dtype = torch.bfloat16,
 ) -> WeightBroadcast:
     if config.type == "nccl":
-        return NCCLWeightBroadcast(output_dir, config, torch.cuda.current_device(), dtype=dtype)
+        return NCCLWeightBroadcast(output_dir, config, torch.cuda.current_device())
     elif config.type == "filesystem":
         return FileSystemWeightBroadcast(output_dir, config, lora_config)
     elif config.type == "nixl":

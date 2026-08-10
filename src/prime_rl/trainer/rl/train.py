@@ -9,7 +9,7 @@ from datetime import timedelta
 
 from prime_rl.trainer.models.layers.attn import substitute_ring_attn
 from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
-from prime_rl.trainer.rl.broadcast.nccl import NCCLWeightBroadcast
+from prime_rl.trainer.rl.broadcast.nixl import NIXLWeightBroadcast
 from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 import torch.distributed as dist
@@ -58,7 +58,7 @@ from prime_rl.trainer.utils import (
     setup_torch_distributed,
     print_benchmark,
 )
-from prime_rl.weight_sync.xor_delta import DeltaUpdate, delta_dtype_from_name
+from prime_rl.weight_sync.xor_delta import DeltaUpdate
 from prime_rl.trainer.world import get_world
 from prime_rl.trainer.runs import setup_multi_run_manager, Progress, get_multi_run_manager
 from prime_rl.trainer.models.layers.lora import set_lora_num_tokens
@@ -169,7 +169,7 @@ def train(config: TrainerConfig):
     if config.max_concurrent_runs == 1:
         delta_mode = (
             config.weight_broadcast.delta_mode
-            if config.weight_broadcast.type in ("nccl", "nixl") and not config.data.fake
+            if config.weight_broadcast.type == "nixl" and not config.data.fake
             else "none"
         )
         optimizer = setup_optimizer(
@@ -181,11 +181,11 @@ def train(config: TrainerConfig):
             delta_mode=delta_mode,
             delta_adam_bucket_mb=(
                 config.weight_broadcast.delta_adam_bucket_mb
-                if config.weight_broadcast.type in ("nccl", "nixl")
+                if config.weight_broadcast.type == "nixl"
                 else 256
             ),
             delta_pipeline_depth=(
-                config.weight_broadcast.delta_pipeline_depth if config.weight_broadcast.type in ("nccl", "nixl") else 2
+                config.weight_broadcast.delta_pipeline_depth if config.weight_broadcast.type == "nixl" else 2
             ),
         )
         scheduler = setup_scheduler(optimizer, config.scheduler, config.max_steps, config.optim.lr)
@@ -212,16 +212,11 @@ def train(config: TrainerConfig):
             config.weight_broadcast,
             parallel_dims,
             config.model.lora,
-            dtype=(
-                delta_dtype_from_name(config.model.optimization_dtype)
-                if config.weight_broadcast.type == "nccl" and config.weight_broadcast.delta_mode == "xor"
-                else torch.bfloat16
-            ),
         )
     delta_optimizer = (
         optimizer
         if weight_broadcast is not None
-        and config.weight_broadcast.type in ("nccl", "nixl")
+        and config.weight_broadcast.type == "nixl"
         and config.weight_broadcast.delta_mode == "xor"
         else None
     )
@@ -612,7 +607,6 @@ def train(config: TrainerConfig):
         record_delta = delta_optimizer is not None
         if record_delta:
             delta_optimizer.begin_delta(base_step=progress.step - 1, step=progress.step)
-        optimizer_start_ns = time.perf_counter_ns()
         optimizer.step()
         if record_delta:
             delta_update = delta_optimizer.take_delta_update()
@@ -640,9 +634,9 @@ def train(config: TrainerConfig):
             )
             if not broadcast_unused:
                 broadcast_weights_start_time = time.perf_counter()
-                if isinstance(weight_broadcast, NCCLWeightBroadcast):
-                    weight_broadcast.nccl_broadcast_sender.set_optimizer_start_ns(optimizer_start_ns)
                 if delta_update is not None:
+                    if not isinstance(weight_broadcast, NIXLWeightBroadcast):
+                        raise TypeError("XOR delta updates require NIXL weight broadcast")
                     weight_broadcast.broadcast_weights(model, step=progress.step, delta_update=delta_update)
                     delta_update = None
                 else:

@@ -1,6 +1,9 @@
 max_steps = 6
 seq_len = 256
 
+[env_vars]
+UCX_TLS = "all"
+
 [model]
 name = "Qwen/Qwen3-32B"
 
@@ -57,8 +60,9 @@ tp = 2
 dp = 1
 
 [weight_broadcast]
-type = "nccl"
-delta_mode = "none"
+type = "nixl"
+host = "127.0.0.1"
+port = 18001
 
 [deployment]
 type = "single_node"

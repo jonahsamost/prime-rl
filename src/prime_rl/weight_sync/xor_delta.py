@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
-from enum import IntEnum
 from math import prod
 from typing import Any, Iterator, Sequence
 
@@ -10,7 +9,6 @@ import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 
-NCCL_DELTA_PROTOCOL_MAGIC = 0x50524C44  # "PRLD"
 NVCOMP_FRAME_ALIGNMENT = 256
 DEFAULT_NVCOMP_PIPELINE_DEPTH = 2
 SUPPORTED_DELTA_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
@@ -31,54 +29,6 @@ _DTYPE_NBYTES = {
     torch.float16: 2,
     torch.float32: 4,
 }
-
-
-class WeightUpdateKind(IntEnum):
-    FULL = 0
-    XOR = 1
-
-
-@dataclass(frozen=True)
-class WeightUpdateHeader:
-    kind: WeightUpdateKind
-    base_step: int
-    step: int
-    optimizer_start_ns: int = 0
-
-
-def encode_weight_update_header(header: WeightUpdateHeader, *, device: torch.device | str | int) -> Tensor:
-    if header.kind == WeightUpdateKind.XOR and header.step != header.base_step + 1:
-        raise ValueError(f"XOR header must name consecutive versions: base_step={header.base_step}, step={header.step}")
-    if header.kind == WeightUpdateKind.FULL and header.base_step != -1:
-        raise ValueError(f"full update header must use base_step=-1, got {header.base_step}")
-    if header.optimizer_start_ns < 0:
-        raise ValueError(f"optimizer_start_ns must be non-negative, got {header.optimizer_start_ns}")
-    return torch.tensor(
-        [
-            NCCL_DELTA_PROTOCOL_MAGIC,
-            int(header.kind),
-            header.base_step,
-            header.step,
-            header.optimizer_start_ns,
-        ],
-        dtype=torch.long,
-        device=device,
-    )
-
-
-def decode_weight_update_header(values: Tensor) -> WeightUpdateHeader:
-    if values.dtype != torch.long or values.shape != (5,):
-        raise ValueError(f"invalid NCCL update header tensor: dtype={values.dtype}, shape={tuple(values.shape)}")
-    magic, kind, base_step, step, optimizer_start_ns = (int(value) for value in values.tolist())
-    if magic != NCCL_DELTA_PROTOCOL_MAGIC:
-        raise ValueError(f"invalid NCCL delta protocol magic: {magic:#x}")
-    try:
-        update_kind = WeightUpdateKind(kind)
-    except ValueError as error:
-        raise ValueError(f"unsupported NCCL weight update kind: {kind}") from error
-    header = WeightUpdateHeader(update_kind, base_step, step, optimizer_start_ns)
-    encode_weight_update_header(header, device="cpu")
-    return header
 
 
 @dataclass(frozen=True)
@@ -158,31 +108,6 @@ class DeltaUpdate:
                 f"compressed frame metadata describes {packed_nbytes} aligned bytes "
                 f"but payload has {self.compressed_nbytes}"
             )
-
-
-@dataclass(frozen=True)
-class ShardedDeltaUpdate:
-    """Rank-local compressed FSDP shards for one logical policy update."""
-
-    base_step: int
-    step: int
-    shards: tuple[DeltaUpdate, ...]
-
-    @property
-    def uncompressed_nbytes(self) -> int:
-        return sum(shard.uncompressed_nbytes for shard in self.shards)
-
-    @property
-    def compressed_nbytes(self) -> int:
-        return sum(shard.compressed_nbytes for shard in self.shards)
-
-    @property
-    def tensor_count(self) -> int:
-        return len(self.shards[0].tensors) if self.shards else 0
-
-    @property
-    def frame_count(self) -> int:
-        return len(self.shards[0].frames) if self.shards else 0
 
 
 def local_tensor(tensor: Tensor) -> Tensor:
@@ -744,122 +669,6 @@ def validate_delta_update(update: DeltaUpdate) -> None:
         )
 
 
-def validate_sharded_delta_update(update: ShardedDeltaUpdate) -> None:
-    if not update.shards:
-        raise ValueError("distributed XOR delta update has no trainer shards")
-    shard_count = len(update.shards)
-    reference = update.shards[0]
-    for rank, shard in enumerate(update.shards):
-        validate_delta_update(shard)
-        if shard.base_step != update.base_step or shard.step != update.step:
-            raise ValueError(
-                f"trainer shard {rank} names policy {shard.base_step}->{shard.step}; "
-                f"expected {update.base_step}->{update.step}"
-            )
-        if len(shard.tensors) != len(reference.tensors) or len(shard.frames) != len(reference.frames):
-            raise ValueError(f"trainer shard {rank} has an incompatible tensor/frame manifest")
-        for tensor_index, (candidate, expected) in enumerate(zip(shard.tensors, reference.tensors, strict=True)):
-            if (
-                candidate.name != expected.name
-                or candidate.dtype != expected.dtype
-                or candidate.resolved_global_shape != expected.resolved_global_shape
-            ):
-                raise ValueError(f"trainer shard {rank} tensor {tensor_index} does not match the rank-0 manifest")
-            if expected.shard_count == 1:
-                if (
-                    candidate.shard_count != 1
-                    or candidate.shard_index != 0
-                    or candidate.shard_dim is not None
-                    or candidate.shape != candidate.resolved_global_shape
-                ):
-                    raise ValueError(f"trainer shard {rank} has incompatible unsharded metadata for {candidate.name}")
-            elif candidate.shard_index != rank or candidate.shard_count != shard_count:
-                raise ValueError(
-                    f"{candidate.name} identifies shard {candidate.shard_index}/{candidate.shard_count}; "
-                    f"expected {rank}/{shard_count}"
-                )
-        for frame_index, (candidate, expected) in enumerate(zip(shard.frames, reference.frames, strict=True)):
-            if (candidate.first_tensor_index, candidate.tensor_count) != (
-                expected.first_tensor_index,
-                expected.tensor_count,
-            ):
-                raise ValueError(f"trainer shard {rank} frame {frame_index} has an incompatible tensor manifest")
-
-    for tensor_index in range(len(reference.tensors)):
-        pieces = [shard.tensors[tensor_index] for shard in update.shards]
-        global_shape = pieces[0].resolved_global_shape
-        if pieces[0].shard_count == 1:
-            if any(piece.shard_count != 1 or piece.shape != global_shape for piece in pieces):
-                raise ValueError(f"{pieces[0].name} has inconsistent unsharded trainer copies")
-            continue
-        if any(piece.shard_dim != 0 for piece in pieces):
-            raise ValueError(f"{pieces[0].name} is not sharded along source dimension 0")
-        if any(piece.shape[1:] != global_shape[1:] for piece in pieces):
-            raise ValueError(f"{pieces[0].name} shard trailing dimensions do not match its global shape")
-        reconstructed = (sum(piece.shape[0] for piece in pieces), *global_shape[1:])
-        if reconstructed != global_shape:
-            raise ValueError(f"{pieces[0].name} shards reconstruct shape {reconstructed}; expected {global_shape}")
-
-
-def reconstruct_delta_tensors(
-    shard_values: Sequence[Sequence[tuple[str, Tensor]]],
-    shard_metadata: Sequence[Sequence[DeltaTensorMetadata]],
-) -> list[tuple[str, Tensor]]:
-    """Reconstruct full source-layout tensors from rank-ordered dimension-0 shards."""
-    if not shard_values or len(shard_values) != len(shard_metadata):
-        raise ValueError("XOR delta reconstruction requires matching non-empty values and metadata")
-    tensor_count = len(shard_values[0])
-    if any(len(values) != tensor_count for values in shard_values) or any(
-        len(metadata) != tensor_count for metadata in shard_metadata
-    ):
-        raise ValueError("XOR delta shard frames contain different tensor counts")
-    reconstructed: list[tuple[str, Tensor]] = []
-    for tensor_index in range(tensor_count):
-        pieces = [values[tensor_index][1] for values in shard_values]
-        metadata = [items[tensor_index] for items in shard_metadata]
-        names = [values[tensor_index][0] for values in shard_values]
-        if any(name != names[0] for name in names) or any(item.name != names[0] for item in metadata):
-            raise ValueError(f"XOR delta shard tensor {tensor_index} has inconsistent names")
-        global_shape = metadata[0].resolved_global_shape
-        if any(item.resolved_global_shape != global_shape for item in metadata):
-            raise ValueError(f"{names[0]} has inconsistent global shapes")
-        dtype = metadata[0].dtype
-        if any(item.dtype != dtype for item in metadata) or any(
-            piece.dtype != delta_dtype_from_name(dtype) for piece in pieces
-        ):
-            raise ValueError(f"{names[0]} has inconsistent XOR delta dtypes")
-        if metadata[0].shard_count == 1:
-            if any(
-                item.shard_count != 1
-                or item.shard_index != 0
-                or item.shard_dim is not None
-                or item.shape != global_shape
-                for item in metadata
-            ):
-                raise ValueError(f"{names[0]} has inconsistent unsharded metadata")
-        else:
-            expected_indices = list(range(metadata[0].shard_count))
-            actual_indices = sorted(item.shard_index for item in metadata)
-            if (
-                len(metadata) != metadata[0].shard_count
-                or actual_indices != expected_indices
-                or any(item.shard_count != len(metadata) or item.shard_dim != 0 for item in metadata)
-            ):
-                raise ValueError(
-                    f"{names[0]} has malformed dimension-0 shards: "
-                    f"indices={actual_indices}, expected={expected_indices}"
-                )
-        ordered = sorted(zip(metadata, pieces, strict=True), key=lambda item: item[0].shard_index)
-        if ordered[0][0].shard_count == 1:
-            value = ordered[0][1]
-        else:
-            value = torch.cat([piece for _, piece in ordered], dim=0)
-        if tuple(value.shape) != global_shape:
-            raise ValueError(f"{names[0]} reconstructed shape {tuple(value.shape)}; expected {global_shape}")
-        reconstructed.append((names[0], value))
-    return reconstructed
-
-
 def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
@@ -886,21 +695,14 @@ __all__ = [
     "DeltaUpdate",
     "NvcompLZ4Codec",
     "SUPPORTED_DELTA_DTYPES",
-    "ShardedDeltaUpdate",
-    "WeightUpdateHeader",
-    "WeightUpdateKind",
     "align_nvcomp_nbytes",
     "delta_dtype_from_name",
     "delta_dtype_name",
     "delta_dtype_nbytes",
     "decode_delta_tensors",
-    "decode_weight_update_header",
-    "encode_weight_update_header",
     "integer_view",
     "local_tensor",
     "packed_delta_nbytes",
-    "reconstruct_delta_tensors",
     "unpack_delta_frame",
     "validate_delta_update",
-    "validate_sharded_delta_update",
 ]

@@ -318,7 +318,6 @@ class Orchestrator:
                 config.weight_broadcast.timeout,
                 inference_world_size=config.weight_broadcast.inference_world_size,
                 quantize_in_weight_transfer=config.weight_broadcast.quantize_in_weight_transfer,
-                delta_mode=config.weight_broadcast.delta_mode,
             )
         elif config.weight_broadcast.type == "nixl":
             await init_nixl_broadcast(

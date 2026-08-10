@@ -545,22 +545,6 @@ class NCCLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     quantize_in_weight_transfer: bool = False
     """Use kernel-format FP8 quantized NCCL transfer for weight updates. When disabled, uses default HF checkpoint-format transfer."""
 
-    delta_mode: Literal["none", "xor"] = "none"
-    """Experimental dense-model GPU nvCOMP LZ4 XOR updates.
-
-    Startup remains a full checkpoint transfer. FSDP ranks compress local
-    ``Shard(0)`` deltas before trainer rank 0 gathers them for NCCL broadcast.
-    """
-
-    delta_adam_bucket_mb: int = Field(256, ge=1)
-    """Maximum local parameter MiB updated by each batched AdamW call.
-
-    An individually larger parameter stands alone.
-    """
-
-    delta_pipeline_depth: int = Field(2, ge=1)
-    """Maximum number of nvCOMP encode batches in flight."""
-
 
 class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     type: Literal["nixl"] = "nixl"
