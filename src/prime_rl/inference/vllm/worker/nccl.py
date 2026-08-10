@@ -25,40 +25,28 @@ else:
 logger = init_logger("vllm.inference.vllm.worker_nccl")
 
 
-def _receive_tensor(
-    tensor: torch.Tensor,
-    communicator: PyNcclCommunicator,
-) -> None:
-    communicator.broadcast(tensor, src=0)
-
-
-def receive_integer(
-    communicator: PyNcclCommunicator,
-) -> int:
+def receive_integer(communicator: PyNcclCommunicator) -> int:
     """Receive an integer from the trainer master rank using NCCL communicator."""
     integer_tensor = torch.tensor([10], dtype=torch.long).to(communicator.device)
-    _receive_tensor(integer_tensor, communicator)
+    communicator.broadcast(integer_tensor, src=0)
     return cast(int, integer_tensor.item())
 
 
-def receive_state_dict(
-    communicator: PyNcclCommunicator,
-) -> Generator[tuple[str, torch.Tensor], None, None]:
+def receive_state_dict(communicator: PyNcclCommunicator) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream tensors in a state dict broadcasted over NCCL."""
     size_tensor = torch.tensor([10], dtype=torch.long).to(communicator.device)
-    _receive_tensor(size_tensor, communicator)
+    communicator.broadcast(size_tensor, src=0)
     state_tensor = torch.empty(cast(int, size_tensor.item()), dtype=torch.uint8).to(communicator.device)
-    _receive_tensor(state_tensor, communicator)
+    communicator.broadcast(state_tensor, src=0)
 
-    state_cpu = state_tensor.cpu()
-    metadata = pickle.loads(bytes(state_cpu.numpy()))
+    metadata = pickle.loads(bytes(state_tensor.cpu().numpy()))
 
     # Receive concatenated tensors per dtype and split them back
     for dtype, tensor_info_list in metadata.items():
         # Receive concatenated tensor for this dtype
         total_elements = sum(numel for _, _, numel in tensor_info_list)
         concatenated = torch.empty(total_elements, dtype=dtype, device=communicator.device)
-        _receive_tensor(concatenated, communicator)
+        communicator.broadcast(concatenated, src=0)
 
         # Split concatenated tensor back into individual tensors
         offset = 0
@@ -122,7 +110,10 @@ class NCCLWeightUpdateWorker(Worker):
         """
         del session_id
         self.quantize_in_weight_transfer = quantize_in_weight_transfer
-        # Each vLLM worker owns its assigned CUDA device, including singleton DP groups.
+        # Use the worker's device index directly as the local rank.
+        # The previous dp_group-based computation broke in vLLM v1 multiprocess
+        # DP mode where each worker is a separate process with a singleton
+        # DP group (rank_in_group is always 0).
         local_rank = self.device.index
         global_rank_inference = rank_offset + local_rank
 

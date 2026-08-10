@@ -25,34 +25,13 @@ from prime_rl.utils.utils import get_broadcast_dir, get_step_path
 from prime_rl.utils.vlm import get_layer_prefix
 
 
-def broadcast_integer(
-    integer: int,
-    communicator: PyNcclCommunicator,
-) -> None:
+def broadcast_integer(integer: int, communicator: PyNcclCommunicator) -> None:
     """Broadcast an integer to a process group using NCCL communicator."""
     integer_tensor = torch.tensor([integer], dtype=torch.long).cuda()
-    _broadcast_tensor(integer_tensor, communicator)
+    communicator.broadcast(integer_tensor, src=0)
 
 
-def _broadcast_tensor(
-    tensor: Tensor,
-    communicator: PyNcclCommunicator,
-) -> None:
-    communicator.broadcast(tensor, src=0)
-
-
-def _stage_bytes(
-    payload: bytes,
-    communicator: PyNcclCommunicator,
-) -> Tensor:
-    values = torch.frombuffer(bytearray(payload), dtype=torch.uint8).to(communicator.device)
-    return values
-
-
-def broadcast_state_dict(
-    state_dict: dict[str, Tensor],
-    communicator: PyNcclCommunicator,
-) -> None:
+def broadcast_state_dict(state_dict: dict[str, Tensor], communicator: PyNcclCommunicator) -> None:
     """Broadcast a state dict to NCCL process group using the PyNcclCommunicator."""
     # Group tensors by dtype
     dtype_groups: dict[torch.dtype, list[tuple[str, Tensor]]] = {}
@@ -73,16 +52,16 @@ def broadcast_state_dict(
     # Send metadata
     state = pickle.dumps(metadata)
     size_tensor = torch.tensor([len(state)], dtype=torch.long).cuda()
-    _broadcast_tensor(size_tensor, communicator)
-    state_tensor = _stage_bytes(state, communicator)
-    _broadcast_tensor(state_tensor, communicator)
+    communicator.broadcast(size_tensor, src=0)
+    state_tensor = torch.ByteTensor(list(state)).cuda()
+    communicator.broadcast(state_tensor, src=0)
 
     # Concatenate and broadcast tensors grouped by dtype
     for dtype, items in dtype_groups.items():
         # Flatten all tensors and concatenate
         flat_tensors = [value.flatten() for _, value in items]
         concatenated = torch.cat(flat_tensors)
-        _broadcast_tensor(concatenated, communicator)
+        communicator.broadcast(concatenated, src=0)
         del concatenated
         # Clean up individual tensors
         for _, value in items:
@@ -162,7 +141,6 @@ class NCCLWeightBroadcastSender:
     def broadcast_weights(self, model: nn.Module, step: int) -> None:
         """Broadcast the state dict of a model into the inference pool using NCCL."""
         state_dict = model.state_dict()
-
         layer_prefix = get_layer_prefix(model.config)
         num_layers = get_max_layer_num(state_dict, layer_prefix)
         num_state_dict_to_send = num_layers + 1  # we send all layer plus the remaining weights
