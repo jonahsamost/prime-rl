@@ -11,10 +11,10 @@ from torch import Tensor
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
 
 from prime_rl.weight_sync.xor_delta import (
+    NVCOMP_FRAME_ALIGNMENT,
     CompressedDeltaFrame,
     DeltaTensorMetadata,
     DeltaUpdate,
-    NVCOMP_FRAME_ALIGNMENT,
     ShardedDeltaUpdate,
     packed_delta_nbytes,
     validate_sharded_delta_update,

@@ -59,8 +59,6 @@ dp = 1
 [weight_broadcast]
 type = "nccl"
 delta_mode = "none"
-delta_adam_bucket_mb = 1024
-delta_pipeline_depth = 8
 
 [deployment]
 type = "single_node"

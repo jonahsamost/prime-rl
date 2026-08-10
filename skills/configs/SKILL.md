@@ -146,6 +146,10 @@ broadcast. NIXL copies frames into reusable registered arenas on their owning
 trainer ranks; rank zero publishes metadata only, and each inference worker
 pulls only frames required by its traced TP/EP routes. Receivers decode and
 apply one transfer group at a time.
+If compression is not beneficial on any trainer rank, all ranks collectively
+fall back to the full-transfer protocol for that policy version; the decision
+must never be made independently because trainer ranks share the same
+distributed transfer sequence.
 
 For a single-node deployment with a loopback `weight_broadcast.host`, the `rl`
 launcher starts an in-memory ModelExpress-compatible metadata server and owns

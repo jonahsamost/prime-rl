@@ -44,9 +44,11 @@ from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
 from prime_rl.trainer.rl.broadcast.nixl.tensor_routing import TensorRoute, route_sharded_tensor
 from prime_rl.trainer.rl.broadcast.nixl.trainer_tensor_table import TrainerTensor, TrainerTensorTable
 from prime_rl.weight_sync.xor_delta import (
+    NVCOMP_FRAME_ALIGNMENT,
     CompressedDeltaFrame,
     DeltaTensorMetadata,
     NvcompLZ4Codec,
+    align_nvcomp_nbytes,
     integer_view,
     unpack_delta_frame,
 )
@@ -661,7 +663,14 @@ class NIXLWeightUpdateWorker(Worker):
                         f"cannot apply NIXL XOR delta {policy.base_step}->{policy.step}: "
                         f"resident policy is {self.current_step}, full_sync_required={self.full_sync_required}"
                     )
-                self.apply_delta_manifest(plan, NIXLDeltaManifest.decode(policy.payload))
+                manifest = NIXLDeltaManifest.decode(policy.payload)
+                if (manifest.base_step, manifest.step) != (policy.base_step, policy.step):
+                    raise RuntimeError(
+                        "NIXL XOR manifest transition does not match its policy metadata: "
+                        f"manifest={manifest.base_step}->{manifest.step}, "
+                        f"policy={policy.base_step}->{policy.step}"
+                    )
+                self.apply_delta_manifest(plan, manifest)
             else:
                 self.apply_transfer_plan(plan)
             update_mla_absorbed_weights(self.raw_model)
@@ -860,11 +869,10 @@ class NIXLWeightUpdateWorker(Worker):
             sum(frame.compressed_nbytes for frame in selected) / 2**20,
         )
 
-        alignment = 256
         offsets: list[int] = []
         used = 0
         for frame in selected:
-            used = (used + alignment - 1) // alignment * alignment
+            used = align_nvcomp_nbytes(used)
             offsets.append(used)
             used += frame.compressed_nbytes
         arena = self.delta_receive_arenas[receive_slot]
@@ -895,7 +903,7 @@ class NIXLWeightUpdateWorker(Worker):
         return list(zip(selected, payloads, strict=True))
 
     def ensure_delta_receive_arenas(self, required_bytes: int, count: int) -> None:
-        required_bytes = max(256, (required_bytes + 255) // 256 * 256)
+        required_bytes = max(NVCOMP_FRAME_ALIGNMENT, align_nvcomp_nbytes(required_bytes))
         if len(self.delta_receive_arenas) == count and self.delta_receive_slot_bytes >= required_bytes:
             return
         for registration in self.delta_receive_registrations:
@@ -921,9 +929,9 @@ class NIXLWeightUpdateWorker(Worker):
     def packed_delta_frame_bytes(frames: list[NIXLDeltaFrame]) -> int:
         used = 0
         for frame in frames:
-            used = (used + 255) // 256 * 256
+            used = align_nvcomp_nbytes(used)
             used += frame.compressed_nbytes
-        return (used + 255) // 256 * 256
+        return align_nvcomp_nbytes(used)
 
     def log_delta_metrics(
         self,

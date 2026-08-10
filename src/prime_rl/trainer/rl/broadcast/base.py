@@ -15,5 +15,5 @@ class WeightBroadcast(ABC):
         self.lora_config = lora_config
 
     @abstractmethod
-    def broadcast_weights(self, model: nn.Module, step: int, delta_update: DeltaUpdate | None = None):
-        pass
+    def broadcast_weights(self, model: nn.Module, step: int, delta_update: DeltaUpdate | None = None) -> None:
+        raise NotImplementedError

@@ -864,12 +864,19 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def align_nvcomp_nbytes(nbytes: int) -> int:
+    """Align a byte count for an nvCOMP frame address."""
+    if nbytes < 0:
+        raise ValueError(f"nvCOMP byte count must be non-negative, got {nbytes}")
+    return _align_up(nbytes, NVCOMP_FRAME_ALIGNMENT)
+
+
 def packed_delta_nbytes(frames: Sequence[CompressedDeltaFrame]) -> int:
     """Return the CUDA payload size including frame and terminal alignment."""
     size = 0
     for frame in frames:
-        size = _align_up(size, NVCOMP_FRAME_ALIGNMENT) + frame.compressed_nbytes
-    return _align_up(size, NVCOMP_FRAME_ALIGNMENT)
+        size = align_nvcomp_nbytes(size) + frame.compressed_nbytes
+    return align_nvcomp_nbytes(size)
 
 
 __all__ = [
@@ -882,6 +889,7 @@ __all__ = [
     "ShardedDeltaUpdate",
     "WeightUpdateHeader",
     "WeightUpdateKind",
+    "align_nvcomp_nbytes",
     "delta_dtype_from_name",
     "delta_dtype_name",
     "delta_dtype_nbytes",

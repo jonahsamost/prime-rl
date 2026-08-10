@@ -48,7 +48,7 @@ from prime_rl.trainer.rl.broadcast.nixl.trainer_tensor_table import (
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.utils import get_world
 from prime_rl.weight_sync.grouping import LAYER_RE
-from prime_rl.weight_sync.xor_delta import DeltaUpdate
+from prime_rl.weight_sync.xor_delta import NVCOMP_FRAME_ALIGNMENT, DeltaUpdate, align_nvcomp_nbytes
 
 BUFFER_POLL_INTERVAL = 0.01
 MAX_STAGING_BUFFER_COUNT = 8
@@ -105,6 +105,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
         self.delta_group_copies: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
         self.staging_buffer_count: int
         self.trainer_table: TrainerTensorTable | None = None
+        self.last_broadcast_step: int | None = None
 
     @property
     def is_serving_rank(self) -> bool:
@@ -474,8 +475,21 @@ class NIXLWeightBroadcast(WeightBroadcast):
     ) -> None:
         ready_runs = list(self.multi_run_manager.ready_to_update_idxs)
         self.initialize_transfer(model)
-        if delta_update is not None:
-            self.broadcast_delta(delta_update, step, ready_runs)
+        if self.config.delta_mode == "xor":
+            delta_available = torch.tensor(
+                delta_update is not None,
+                dtype=torch.uint8,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            dist.all_reduce(delta_available, op=dist.ReduceOp.MIN)
+            if bool(delta_available.item()):
+                assert delta_update is not None
+                self.broadcast_delta(delta_update, step, ready_runs)
+                return
+            reason = None
+            if self.last_broadcast_step is not None:
+                reason = "at least one trainer rank rejected its XOR payload"
+            self.broadcast_full(step, ready_runs, reason=reason)
             return
         self.broadcast_full(step, ready_runs)
 
@@ -531,6 +545,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
             self.finish_staging_buffer_transfer(buffer_index)
 
         self.finish_policy_transfer()
+        self.last_broadcast_step = step
         for run_index in ready_runs:
             self.multi_run_manager.ready_to_update[run_index] = False
         reason_suffix = f" ({reason})" if reason is not None else ""
@@ -542,7 +557,10 @@ class NIXLWeightBroadcast(WeightBroadcast):
     def build_local_delta_manifest(self, update: DeltaUpdate) -> NIXLDeltaManifest:
         groups = build_local_delta_groups(update, self.transfer_group_names)
         frame_payloads = {payload.data_ptr(): payload for payload in update.frame_payloads()}
-        group_sizes = [sum((frame.compressed_nbytes + 255) // 256 * 256 for frame in frames) for frames in groups]
+        group_sizes = [
+            sum(align_nvcomp_nbytes(frame.compressed_nbytes) for frame in frames)
+            for frames in groups
+        ]
         required_slot_bytes = max(group_sizes, default=0)
         self.ensure_delta_staging_arena(required_slot_bytes)
         assert self.delta_staging_arena is not None
@@ -555,7 +573,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
             staged_frames: list[NIXLDeltaFrame] = []
             copies: list[tuple[torch.Tensor, torch.Tensor]] = []
             for frame in frames:
-                offset = (offset + 255) // 256 * 256
+                offset = align_nvcomp_nbytes(offset)
                 destination = self.delta_staging_arena.narrow(
                     0,
                     slot_offset + offset,
@@ -592,7 +610,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
         )
 
     def ensure_delta_staging_arena(self, slot_bytes: int) -> None:
-        slot_bytes = max(256, (slot_bytes + 255) // 256 * 256)
+        slot_bytes = max(NVCOMP_FRAME_ALIGNMENT, align_nvcomp_nbytes(slot_bytes))
         if self.delta_staging_arena is not None and slot_bytes <= self.delta_staging_slot_bytes:
             return
         if self.delta_staging_registration is not None:
@@ -622,6 +640,10 @@ class NIXLWeightBroadcast(WeightBroadcast):
             raise ValueError("received an XOR update while NIXL delta mode is disabled")
         if update.step != step:
             raise ValueError(f"delta step {update.step} does not match broadcast step {step}")
+        if update.base_step != self.last_broadcast_step:
+            raise ValueError(
+                f"delta base step {update.base_step} does not match last broadcast {self.last_broadcast_step}"
+            )
         start = time.perf_counter()
         manifest = self.gather_delta_manifest(update)
         fallback_to_full = False
@@ -684,6 +706,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
             self.finish_staging_buffer_transfer(group_index % self.staging_buffer_count)
 
         self.finish_policy_transfer()
+        self.last_broadcast_step = step
 
         for run_index in ready_runs:
             self.multi_run_manager.ready_to_update[run_index] = False
