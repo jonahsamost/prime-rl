@@ -147,8 +147,13 @@ async def init_broadcaster(request: Request):
     session_id = data.get("session_id", "default")
     args = (host, port, rank_offset, inference_world_size, timeout, quantize_in_weight_transfer)
     args += (session_id,)
-    if "delta_mode" in data:
-        args += (data["delta_mode"],)
+    if "delta_mode" in data or "delta_cuda_graphs" in data:
+        args += (
+            data.get("delta_mode", "none"),
+            data.get("delta_representation", "source"),
+            data.get("delta_fp8_scale_format", "float32"),
+            data.get("delta_cuda_graphs", True),
+        )
     await engine_client(request).collective_rpc(
         "init_broadcaster",
         args=args,

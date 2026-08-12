@@ -169,7 +169,9 @@ def train(config: TrainerConfig):
     if config.max_concurrent_runs == 1:
         delta_mode = (
             config.weight_broadcast.delta_mode
-            if config.weight_broadcast.type == "nixl" and not config.data.fake
+            if config.weight_broadcast.type == "nixl"
+            and config.weight_broadcast.delta_representation == "source"
+            and not config.data.fake
             else "none"
         )
         optimizer = setup_optimizer(
@@ -179,6 +181,11 @@ def train(config: TrainerConfig):
             lora=config.model.lora is not None,
             cpu_offload=config.model.optim_cpu_offload,
             delta_mode=delta_mode,
+            bucketed_adam=(
+                config.weight_broadcast.type == "nixl"
+                and config.weight_broadcast.delta_representation == "fp8_kernel"
+                and not config.data.fake
+            ),
             delta_adam_bucket_mb=(
                 config.weight_broadcast.delta_adam_bucket_mb
                 if config.weight_broadcast.type == "nixl"
@@ -218,6 +225,7 @@ def train(config: TrainerConfig):
         if weight_broadcast is not None
         and config.weight_broadcast.type == "nixl"
         and config.weight_broadcast.delta_mode == "xor"
+        and config.weight_broadcast.delta_representation == "source"
         else None
     )
 

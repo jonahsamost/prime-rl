@@ -74,6 +74,11 @@ def test_nixl_delta_manifest_merge_reindexes_agents():
 def test_nixl_delta_graph_rejects_intermediate_dtype_conversion():
     assert chain_preserves_dtype(
         (4, 4),
+        torch.float8_e4m3fn,
+        (TensorOperation("transpose", (0, 1)), TensorOperation("contiguous")),
+    )
+    assert chain_preserves_dtype(
+        (4, 4),
         torch.bfloat16,
         (TensorOperation("transpose", (0, 1)), TensorOperation("contiguous")),
     )

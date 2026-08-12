@@ -15,7 +15,7 @@ from prime_rl.weight_sync.xor_delta import (
     delta_dtype_nbytes,
 )
 
-NIXL_DELTA_PROTOCOL_VERSION = 1
+NIXL_DELTA_PROTOCOL_VERSION = 3
 
 
 class NIXLDeltaAgent(msgspec.Struct, frozen=True):
@@ -79,6 +79,8 @@ class NIXLDeltaManifest(msgspec.Struct, frozen=True):
     step: int
     agents: tuple[NIXLDeltaAgent, ...]
     groups: tuple[NIXLDeltaGroup, ...]
+    representation: str = "source"
+    fp8_scale_format: str = ""
 
     def encode(self) -> bytes:
         validate_nixl_delta_manifest(self)
@@ -151,6 +153,11 @@ def merge_delta_manifest_fragments(fragments: list[NIXLDeltaManifest]) -> NIXLDe
             raise ValueError("NIXL delta fragments name different policy transitions")
         if tuple(group.name for group in fragment.groups) != tuple(group.name for group in reference.groups):
             raise ValueError("NIXL delta fragments have different transfer groups")
+        if (
+            fragment.representation != reference.representation
+            or fragment.fp8_scale_format != reference.fp8_scale_format
+        ):
+            raise ValueError("NIXL delta fragments use different tensor representations")
         if len(fragment.agents) != 1:
             raise ValueError("a local NIXL delta fragment must describe exactly one agent")
         agent_index = len(agents)
@@ -175,6 +182,8 @@ def merge_delta_manifest_fragments(fragments: list[NIXLDeltaManifest]) -> NIXLDe
             NIXLDeltaGroup(name=reference.groups[index].name, frames=tuple(frames))
             for index, frames in enumerate(groups)
         ),
+        representation=reference.representation,
+        fp8_scale_format=reference.fp8_scale_format,
     )
     validate_nixl_delta_manifest(manifest)
     return manifest
@@ -185,6 +194,12 @@ def validate_nixl_delta_manifest(manifest: NIXLDeltaManifest) -> None:
         raise ValueError(f"unsupported NIXL delta protocol version {manifest.protocol_version}")
     if manifest.step != manifest.base_step + 1:
         raise ValueError(f"NIXL XOR update must name consecutive versions: {manifest.base_step}->{manifest.step}")
+    if manifest.representation not in ("source", "fp8_kernel"):
+        raise ValueError(f"unsupported NIXL delta representation {manifest.representation!r}")
+    if manifest.representation == "fp8_kernel" and manifest.fp8_scale_format not in ("float32", "ue8m0"):
+        raise ValueError(f"unsupported FP8 kernel scale format {manifest.fp8_scale_format!r}")
+    if manifest.representation == "source" and manifest.fp8_scale_format:
+        raise ValueError("source-representation NIXL deltas cannot declare an FP8 scale format")
     if not manifest.agents:
         raise ValueError("NIXL delta manifest has no trainer agents")
     agent_names = [agent.name for agent in manifest.agents]

@@ -544,12 +544,12 @@ def test_shared_and_subconfig_disjoint_fields_coexist():
 def test_xor_weight_transfer_propagates_to_nixl_components(dtype):
     config = RLConfig.model_validate(
         {
-            "model": {"name": "Qwen/Qwen3-0.6B-Base"},
             "weight_broadcast": {
                 "type": "nixl",
                 "delta_mode": "xor",
                 "delta_adam_bucket_mb": 192,
                 "delta_pipeline_depth": 3,
+                "delta_cuda_graphs": False,
             },
             "trainer": {"model": {"optimization_dtype": dtype}},
             "orchestrator": {"renderer": {"name": "default"}},
@@ -559,12 +559,16 @@ def test_xor_weight_transfer_propagates_to_nixl_components(dtype):
 
     assert config.trainer.weight_broadcast.type == "nixl"
     assert config.trainer.weight_broadcast.delta_mode == "xor"
+    assert config.trainer.weight_broadcast.delta_representation == "source"
     assert config.trainer.weight_broadcast.delta_adam_bucket_mb == 192
     assert config.trainer.weight_broadcast.delta_pipeline_depth == 3
+    assert config.trainer.weight_broadcast.delta_cuda_graphs is False
     assert config.orchestrator.weight_broadcast.type == "nixl"
     assert config.orchestrator.weight_broadcast.delta_mode == "xor"
+    assert config.orchestrator.weight_broadcast.delta_representation == "source"
     assert config.orchestrator.weight_broadcast.delta_adam_bucket_mb == 192
     assert config.orchestrator.weight_broadcast.delta_pipeline_depth == 3
+    assert config.orchestrator.weight_broadcast.delta_cuda_graphs is False
 
 
 def test_nccl_weight_transfer_rejects_xor_configuration():
@@ -577,20 +581,72 @@ def test_nccl_weight_transfer_rejects_xor_configuration():
         )
 
 
-def test_xor_weight_transfer_rejects_quantization():
-    with pytest.raises(ValidationError, match="does not support quantized models"):
+@pytest.mark.parametrize("delta_mode", ["none", "xor"])
+def test_weight_transfer_accepts_fp8_kernel_representation(delta_mode):
+    config = RLConfig.model_validate(
+        {
+            "weight_broadcast": {
+                "type": "nixl",
+                "delta_mode": delta_mode,
+                "delta_representation": "fp8_kernel",
+                "delta_fp8_scale_format": "float32",
+            },
+            "trainer": {
+                "model": {
+                    "name": "Qwen/Qwen3-0.6B-Base",
+                    "optimization_dtype": "bfloat16",
+                    "impl": "custom",
+                }
+            },
+            "orchestrator": {
+                "model": {"name": "Qwen/Qwen3-0.6B-FP8"},
+                "renderer": {"name": "default"},
+            },
+            "inference": {
+                "model": {"name": "Qwen/Qwen3-0.6B-FP8", "dtype": "bfloat16"},
+                "parallel": {"tp": 1},
+            },
+        }
+    )
+
+    assert config.trainer.weight_broadcast.delta_representation == "fp8_kernel"
+    assert config.trainer.weight_broadcast.delta_fp8_scale_format == "float32"
+    assert config.orchestrator.weight_broadcast.delta_representation == "fp8_kernel"
+    assert config.orchestrator.weight_broadcast.delta_fp8_scale_format == "float32"
+
+
+def test_source_xor_weight_transfer_rejects_quantization():
+    with pytest.raises(ValidationError, match="source-representation XOR"):
         RLConfig.model_validate(
             {
                 "model": {"name": "Qwen/Qwen3-0.6B-Base"},
                 "weight_broadcast": {"type": "nixl", "delta_mode": "xor"},
-                "trainer": {
-                    "model": {
-                        "optimization_dtype": "bfloat16",
-                        "quantization": {"type": "fp8"},
-                    }
-                },
+                "trainer": {"model": {"quantization": {"type": "fp8"}}},
                 "orchestrator": {"renderer": {"name": "default"}},
                 "inference": {"model": {"dtype": "bfloat16"}, "parallel": {"tp": 1}},
+            }
+        )
+
+
+def test_fp8_kernel_xor_rejects_online_inference_quantization():
+    with pytest.raises(ValidationError, match="pre-quantized FP8 inference checkpoint"):
+        RLConfig.model_validate(
+            {
+                "weight_broadcast": {
+                    "type": "nixl",
+                    "delta_mode": "xor",
+                    "delta_representation": "fp8_kernel",
+                },
+                "trainer": {"model": {"name": "Qwen/Qwen3-0.6B-Base", "impl": "custom"}},
+                "orchestrator": {
+                    "model": {"name": "Qwen/Qwen3-0.6B-FP8"},
+                    "renderer": {"name": "default"},
+                },
+                "inference": {
+                    "quantization": "fp8",
+                    "model": {"name": "Qwen/Qwen3-0.6B-FP8", "dtype": "bfloat16"},
+                    "parallel": {"tp": 1},
+                },
             }
         )
 

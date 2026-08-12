@@ -581,6 +581,9 @@ async def init_nixl_broadcast(
     inference_world_size: int,
     session_id: str,
     delta_mode: str = "none",
+    delta_representation: str = "source",
+    delta_fp8_scale_format: str = "float32",
+    delta_cuda_graphs: bool = True,
 ) -> None:
     """Configure every vLLM worker for NIXL + ModelExpress pulls."""
     workers_per_server = inference_world_size // len(admin_clients)
@@ -599,6 +602,9 @@ async def init_nixl_broadcast(
                 "quantize_in_weight_transfer": False,
                 "session_id": session_id,
                 "delta_mode": delta_mode,
+                "delta_representation": delta_representation,
+                "delta_fp8_scale_format": delta_fp8_scale_format,
+                "delta_cuda_graphs": delta_cuda_graphs,
             },
         )
 

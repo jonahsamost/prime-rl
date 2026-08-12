@@ -8,7 +8,7 @@ from torch.distributed.tensor import DTensor
 from torch.optim import SGD, AdamW, Optimizer
 
 from prime_rl.configs.trainer import OptimizerConfig
-from prime_rl.trainer.delta_adamw import DeltaAdamW
+from prime_rl.trainer.delta_adamw import BucketedAdamW, DeltaAdamW
 from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.sign_sgd import SignSGD
@@ -124,11 +124,16 @@ def setup_optimizer(
     lora: bool = False,
     cpu_offload: bool = False,
     delta_mode: str = "none",
+    bucketed_adam: bool = False,
     delta_adam_bucket_mb: int = 512,
     delta_pipeline_depth: int = 8,
 ) -> Optimizer | CPUOffloadOptimizer:
     if delta_mode != "none" and config.type != "adamw":
         raise ValueError(f"delta mode {delta_mode!r} requires AdamW, got {config.type!r}")
+    if bucketed_adam and config.type != "adamw":
+        raise ValueError(f"bucketed Adam requires AdamW, got {config.type!r}")
+    if bucketed_adam:
+        get_logger().info(f"Using bucketed AdamW with {delta_adam_bucket_mb} MiB buckets")
     if lora:
         # Wait for run 0 to be created in the multi run manager
         # Otherwise, the creation will reset the parameters
@@ -141,6 +146,7 @@ def setup_optimizer(
         named_params,
         parallel_dims,
         delta_mode=delta_mode,
+        bucketed_adam=bucketed_adam,
         delta_adam_bucket_mb=delta_adam_bucket_mb,
         delta_pipeline_depth=delta_pipeline_depth,
     )
@@ -158,6 +164,7 @@ def _create_optimizer(
     parallel_dims: ParallelDims,
     lr: float | None = None,
     delta_mode: str = "none",
+    bucketed_adam: bool = False,
     delta_adam_bucket_mb: int = 512,
     delta_pipeline_depth: int = 8,
 ) -> Optimizer:
@@ -187,6 +194,14 @@ def _create_optimizer(
                     betas=(config.betas1, config.betas2),
                     delta_adam_bucket_bytes=delta_adam_bucket_mb * 1024 * 1024,
                     delta_pipeline_depth=delta_pipeline_depth,
+                )
+            if bucketed_adam:
+                return BucketedAdamW(
+                    params=named_params,
+                    lr=lr,
+                    weight_decay=config.weight_decay,
+                    betas=(config.betas1, config.betas2),
+                    adam_bucket_bytes=delta_adam_bucket_mb * 1024 * 1024,
                 )
             return AdamW(
                 params=trainable_params,

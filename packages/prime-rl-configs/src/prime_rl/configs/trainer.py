@@ -558,11 +558,20 @@ class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     delta_mode: Literal["none", "xor"] = "none"
     """Use exact GPU nvCOMP LZ4 XOR updates after the initial full transfer."""
 
+    delta_representation: Literal["source", "fp8_kernel"] = "source"
+    """NIXL wire representation; FP8 XOR uses TP-local resident kernel tensors."""
+
+    delta_fp8_scale_format: Literal["float32", "ue8m0"] = "float32"
+    """Scale representation emitted with FP8 kernel tensors."""
+
     delta_adam_bucket_mb: int = Field(512, ge=1)
     """Maximum local parameter MiB updated by each batched delta-aware AdamW call."""
 
     delta_pipeline_depth: int = Field(8, ge=1)
     """Maximum number of nvCOMP encode batches in flight."""
+
+    delta_cuda_graphs: bool = True
+    """Receiver CUDA-graph setting propagated with the shared NIXL config."""
 
 
 WeightBroadcastConfig: TypeAlias = Annotated[

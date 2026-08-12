@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import msgspec
 
+NIXL_TENSOR_TABLE_PROTOCOL_VERSION = 2
+
 
 class TrainerAgent(msgspec.Struct, frozen=True):
     """One trainer rank's NIXL agent."""
@@ -51,6 +53,9 @@ class TrainerTensorTable(msgspec.Struct):
     agents: list[TrainerAgent]
     staging_buffer_count: int
     groups: list[TrainerGroup]
+    representation: str = "source"
+    fp8_scale_format: str = ""
+    protocol_version: int = NIXL_TENSOR_TABLE_PROTOCOL_VERSION
 
     def encode(self) -> bytes:
         return msgspec.msgpack.encode(self)
@@ -58,3 +63,13 @@ class TrainerTensorTable(msgspec.Struct):
     @classmethod
     def decode(cls, data: bytes) -> TrainerTensorTable:
         return msgspec.msgpack.decode(data, type=cls)
+
+
+__all__ = [
+    "NIXL_TENSOR_TABLE_PROTOCOL_VERSION",
+    "TrainerAgent",
+    "TrainerGroup",
+    "TrainerShard",
+    "TrainerTensor",
+    "TrainerTensorTable",
+]

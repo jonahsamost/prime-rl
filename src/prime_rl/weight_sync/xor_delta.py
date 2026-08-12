@@ -11,20 +11,36 @@ from torch.distributed.tensor import DTensor
 
 NVCOMP_FRAME_ALIGNMENT = 256
 DEFAULT_NVCOMP_PIPELINE_DEPTH = 8
-SUPPORTED_DELTA_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+SUPPORTED_DELTA_DTYPES = (
+    torch.uint8,
+    torch.int32,
+    torch.float8_e4m3fn,
+    torch.bfloat16,
+    torch.float16,
+    torch.float32,
+)
 
 _DTYPE_NAMES = {
+    torch.uint8: "uint8",
+    torch.int32: "int32",
+    torch.float8_e4m3fn: "float8_e4m3fn",
     torch.bfloat16: "bfloat16",
     torch.float16: "float16",
     torch.float32: "float32",
 }
 _DTYPES_BY_NAME = {name: dtype for dtype, name in _DTYPE_NAMES.items()}
 _INTEGER_DTYPES = {
+    torch.uint8: torch.uint8,
+    torch.int32: torch.int32,
+    torch.float8_e4m3fn: torch.uint8,
     torch.bfloat16: torch.int16,
     torch.float16: torch.int16,
     torch.float32: torch.int32,
 }
 _DTYPE_NBYTES = {
+    torch.uint8: 1,
+    torch.int32: 4,
+    torch.float8_e4m3fn: 1,
     torch.bfloat16: 2,
     torch.float16: 2,
     torch.float32: 4,

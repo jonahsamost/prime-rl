@@ -20,6 +20,23 @@ class PreTrainedModelPrimeRL(PreTrainedModel):
         return False
 
     @classmethod
+    def keep_unquantized_for_fp8_weight_transfer(cls, name: str) -> bool:
+        """Whether an inference tensor remains in its source precision beside FP8 kernels."""
+        return any(
+            pattern in name
+            for pattern in (
+                "lm_head",
+                ".router.",
+                ".mlp.gate.",
+                "shared_expert_gate",
+                "eh_proj",
+                "weights_proj",
+                "in_proj_a",
+                "in_proj_b",
+            )
+        )
+
+    @classmethod
     def from_config(cls, config, **kwargs):
         """Public from_config that mirrors the Auto class API."""
         return cls._from_config(config, **kwargs)
@@ -115,12 +132,12 @@ class PreTrainedModelPrimeRL(PreTrainedModel):
         """
         return state_dict
 
-    @classmethod
     def convert_layer_to_vllm_kernel(
-        cls,
+        self,
         state_dict: dict[str, Tensor],
         layer_idx: int,
         quantize_fp8: bool = False,
+        fp8_scale_format: str | None = None,
     ) -> dict[str, Tensor]:
         """
         Convert a single layer's state dict from PrimeRL format to vLLM kernel format.
@@ -129,8 +146,43 @@ class PreTrainedModelPrimeRL(PreTrainedModel):
             state_dict: Layer weights in PrimeRL format.
             layer_idx: Layer index to convert.
             quantize_fp8: Whether to emit FP8 (e4m3) kernel weights with per-block scales.
+            fp8_scale_format: Explicit scale layout for the target inference kernels.
         """
-        raise NotImplementedError(f"convert_layer_to_vllm_kernel is not implemented for {cls.__name__}")
+        from prime_rl.weight_sync.fp8 import quantize_to_vllm_kernel_format
+
+        converted = self.convert_layer_to_hf(state_dict, layer_idx)
+        if not quantize_fp8:
+            return converted
+        if fp8_scale_format not in (None, "float32", "ue8m0"):
+            raise ValueError(f"unsupported FP8 scale format {fp8_scale_format!r}")
+
+        kernel_tensors: dict[str, Tensor] = {}
+        for name, tensor in converted.items():
+            keep_unquantized = (
+                tensor.ndim != 2
+                or self.keep_in_fp32_for_weight_transfer(name)
+                or self.keep_unquantized_for_fp8_weight_transfer(name)
+            )
+            if keep_unquantized:
+                kernel_tensors[name] = tensor
+                continue
+            weight, scale = quantize_to_vllm_kernel_format(
+                tensor,
+                scale_format=fp8_scale_format or "float32",
+            )
+            kernel_tensors[name] = weight
+            kernel_tensors[name.removesuffix(".weight") + ".weight_scale_inv"] = scale
+        return kernel_tensors
+
+    def convert_layer_to_vllm_resident(
+        self,
+        state_dict: dict[str, Tensor],
+        layer_idx: int,
+        *,
+        inference_tp_size: int,
+        fp8_scale_format: str,
+    ) -> dict[str, Tensor]:
+        raise NotImplementedError(f"resident FP8 weight transfer is not implemented for {self.__class__.__name__}")
 
     def init_buffers_post_meta(self) -> None:
         """

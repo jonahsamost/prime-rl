@@ -37,6 +37,7 @@ from prime_rl.trainer.rl.broadcast.nixl.delta_manifest import (
     build_local_delta_groups,
     merge_delta_manifest_fragments,
 )
+from prime_rl.trainer.rl.broadcast.nixl.fp8 import FP8ResidentProducer
 from prime_rl.trainer.rl.broadcast.nixl.model_express import ModelExpressSession
 from prime_rl.trainer.rl.broadcast.nixl.notifications import (
     NIXLNotificationInbox,
@@ -52,6 +53,7 @@ from prime_rl.trainer.rl.broadcast.nixl.trainer_tensor_table import (
 )
 from prime_rl.trainer.runs import get_multi_run_manager
 from prime_rl.trainer.utils import get_world
+from prime_rl.weight_sync.fp8 import FP8ScaleFormat
 from prime_rl.weight_sync.grouping import LAYER_RE
 from prime_rl.weight_sync.xor_delta import NVCOMP_FRAME_ALIGNMENT, DeltaUpdate, align_nvcomp_nbytes
 
@@ -103,6 +105,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
         self.staged_shards_by_group: dict[int, list[StagedTensorShard]] = {}
         self.staging_arenas: dict[torch.dtype, torch.Tensor] = {}
         self.staging_registrations: list[object] = []
+        self.full_transfer_resources_active = False
         self.delta_staging_arena: torch.Tensor | None = None
         self.delta_staging_registration: object | None = None
         self.delta_staging_slot_bytes = 0
@@ -112,6 +115,20 @@ class NIXLWeightBroadcast(WeightBroadcast):
         self.last_broadcast_step: int | None = None
         self.inference_notification_peers: dict[int, str] = {}
         self.notification_inbox = NIXLNotificationInbox()
+        self.fp8_resident_producer = (
+            FP8ResidentProducer(
+                device=torch.device("cuda", torch.cuda.current_device()),
+                scale_format=cast(FP8ScaleFormat, self.config.delta_fp8_scale_format),
+                bucket_bytes=self.config.delta_adam_bucket_mb * 1024 * 1024,
+                pipeline_depth=self.config.delta_pipeline_depth,
+                rank=self.world.rank,
+                world_size=self.world.world_size,
+                inference_tp_size=self.config.inference_world_size,
+                retain_resident=self.config.delta_mode == "xor",
+            )
+            if self.config.delta_representation == "fp8_kernel"
+            else None
+        )
 
     @property
     def is_serving_rank(self) -> bool:
@@ -147,13 +164,15 @@ class NIXLWeightBroadcast(WeightBroadcast):
         local_shards: list[StagedTensorShard] = []
         for name, value in state_dict.items():
             # Non-floating state is not part of model weight transfer.
-            if not value.is_floating_point():
+            if not value.is_floating_point() and not (
+                self.config.delta_representation == "fp8_kernel" and value.dtype == torch.uint8
+            ):
                 continue
             full_shape = tuple(value.shape)
             group_index = self.find_transfer_group_index(name, transfer_groups)
             wire_dtype = (
                 value.dtype
-                if self.config.delta_mode == "xor"
+                if self.config.delta_mode == "xor" or self.config.delta_representation == "fp8_kernel"
                 else torch.float32
                 if keep_in_fp32(name)
                 else torch.bfloat16
@@ -161,7 +180,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
 
             # Unsharded tensors are identical on every rank, so rank 0 serves the only copy.
             if not isinstance(value, DTensor):
-                if self.world.is_master:
+                if self.config.delta_representation == "fp8_kernel" or self.world.is_master:
                     local_shards.append(
                         StagedTensorShard(
                             name=name,
@@ -215,6 +234,8 @@ class NIXLWeightBroadcast(WeightBroadcast):
 
     def choose_staging_buffer_count(self, largest_group_bytes: int) -> int:
         local_buffer_count = min(len(self.transfer_group_names), MAX_STAGING_BUFFER_COUNT)
+        if self.fp8_resident_producer is not None:
+            local_buffer_count = 1
         if self.is_serving_rank and largest_group_bytes:
             device = self.staged_shards[0].source_tensor.device
             allocated_bytes = torch.cuda.memory_allocated()
@@ -322,6 +343,10 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 TrainerGroup(name=group_name, tensors=list(tensors.values()))
                 for group_name, tensors in zip(self.transfer_group_names, tensors_by_group)
             ],
+            representation=self.config.delta_representation,
+            fp8_scale_format=(
+                self.config.delta_fp8_scale_format if self.config.delta_representation == "fp8_kernel" else ""
+            ),
         )
 
     def gather_trainer_table_fragments(self) -> list[bytes] | None:
@@ -337,6 +362,10 @@ class NIXLWeightBroadcast(WeightBroadcast):
         tensors_by_group: list[dict[str, TrainerTensor]] = [{} for _ in self.transfer_group_names]
         for agent_index, encoded_fragment in enumerate(table_fragments):
             fragment = TrainerTensorTable.decode(encoded_fragment)
+            if fragment.representation != self.config.delta_representation or fragment.fp8_scale_format != (
+                self.config.delta_fp8_scale_format if self.config.delta_representation == "fp8_kernel" else ""
+            ):
+                raise RuntimeError("trainer ranks produced incompatible NIXL tensor representations")
             agents.append(fragment.agents[0])
             for group_index, group in enumerate(fragment.groups):
                 tensors = tensors_by_group[group_index]
@@ -371,14 +400,23 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 TrainerGroup(name=group_name, tensors=list(tensors.values()))
                 for group_name, tensors in zip(self.transfer_group_names, tensors_by_group)
             ],
+            representation=self.config.delta_representation,
+            fp8_scale_format=(
+                self.config.delta_fp8_scale_format if self.config.delta_representation == "fp8_kernel" else ""
+            ),
         )
 
-    def initialize_transfer(self, model: nn.Module) -> None:
+    def initialize_transfer(
+        self,
+        model: nn.Module,
+        state_dict: dict[str, torch.Tensor] | None = None,
+        transfer_groups: TransferGroupIndex | None = None,
+    ) -> None:
         if self.initialized:
             return
         model = cast(PreTrainedModelPrimeRL, model)
-        state_dict = model.state_dict()
-        transfer_groups = self.build_transfer_group_index(state_dict)
+        state_dict = model.state_dict() if state_dict is None else state_dict
+        transfer_groups = transfer_groups or self.build_transfer_group_index(state_dict)
         self.transfer_group_names = transfer_groups.group_names
         if self.is_serving_rank:
             self.staged_shards = self.collect_local_tensor_shards(
@@ -387,6 +425,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 model.keep_in_fp32_for_weight_transfer,
             )
         self.prepare_staging_buffers()
+        self.full_transfer_resources_active = True
         table_fragments = self.gather_trainer_table_fragments()
 
         if table_fragments is not None:
@@ -418,6 +457,65 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 f"from {len(table.agents)} agents with {self.staging_buffer_count} staging buffers"
             )
         self.initialized = True
+
+    def release_full_transfer_resources(self) -> None:
+        if not self.full_transfer_resources_active:
+            return
+
+        source_bytes = sum(
+            shard.source_tensor.numel() * shard.source_tensor.element_size() for shard in self.staged_shards
+        )
+        staging_bytes = sum(arena.numel() * arena.element_size() for arena in self.staging_arenas.values())
+        allocated_before = torch.cuda.memory_allocated()
+        free_before, _ = torch.cuda.mem_get_info()
+
+        self.deregister_full_staging_arenas()
+        self.staging_registrations.clear()
+        self.staged_shards_by_group.clear()
+        self.staged_shards.clear()
+        self.staging_arenas.clear()
+        self.trainer_table = None
+        self.full_transfer_resources_active = False
+        torch.cuda.empty_cache()
+
+        allocated_after = torch.cuda.memory_allocated()
+        free_after, _ = torch.cuda.mem_get_info()
+        self.logger.info(
+            f"Released FP8 startup full-transfer resources on trainer rank {self.world.rank}: "
+            f"checkpoint_sources={source_bytes / 2**30:.2f} GiB, "
+            f"staging_arenas={staging_bytes / 2**30:.2f} GiB, "
+            f"allocated={allocated_before / 2**30:.2f}->{allocated_after / 2**30:.2f} GiB, "
+            f"device_free={free_before / 2**30:.2f}->{free_after / 2**30:.2f} GiB"
+        )
+
+    def update_staged_sources(self, state_dict: dict[str, torch.Tensor]) -> None:
+        if not self.is_serving_rank:
+            return
+        for shard in self.staged_shards:
+            try:
+                source = state_dict[shard.name]
+            except KeyError as error:
+                raise RuntimeError(f"FP8 kernel snapshot is missing staged tensor {shard.name!r}") from error
+            if tuple(source.shape) != shard.global_shape or source.dtype != shard.wire_dtype:
+                raise RuntimeError(
+                    f"FP8 kernel tensor {shard.name!r} changed representation: "
+                    f"{shard.global_shape}/{shard.wire_dtype} -> {tuple(source.shape)}/{source.dtype}"
+                )
+            shard.source_tensor = source
+
+    def stage_full_group(self, group_index: int) -> None:
+        if not self.is_serving_rank:
+            return
+        for shard in self.staged_shards_by_group.get(group_index, ()):
+            shard.copy_to_staging()
+        torch.cuda.synchronize()
+
+    def deregister_full_staging_arenas(self) -> None:
+        if not self.is_serving_rank:
+            return
+        torch.cuda.synchronize()
+        for registration in self.staging_registrations:
+            self.nixl_agent.deregister_tensor(registration)
 
     def prepare_inference_notification_peers(self) -> None:
         if not self.world.is_master or self.inference_notification_peers:
@@ -505,16 +603,43 @@ class NIXLWeightBroadcast(WeightBroadcast):
         delta_update: DeltaUpdate | None = None,
     ) -> None:
         ready_runs = list(self.multi_run_manager.ready_to_update_idxs)
-        self.initialize_transfer(model)
+        if self.fp8_resident_producer is not None:
+            transfer_groups = self.build_transfer_group_index(model.state_dict())
+            transfer_tensors = self.fp8_resident_producer.build_transfer_tensors(
+                model,
+                include_checkpoint=not self.initialized or self.config.delta_mode == "none",
+            )
+            if not self.initialized:
+                if transfer_tensors.resident:
+                    self.fp8_resident_producer.initialize_tensors(transfer_tensors.resident, step=step)
+                self.initialize_transfer(model, transfer_tensors.checkpoint, transfer_groups)
+            else:
+                if self.last_broadcast_step is None:
+                    raise RuntimeError("FP8 resident transfer was initialized without a policy version")
+                if transfer_tensors.resident and self.config.delta_mode == "xor":
+                    _snapshot, delta_update = self.fp8_resident_producer.advance_tensors(
+                        transfer_tensors.resident,
+                        base_step=self.last_broadcast_step,
+                        step=step,
+                    )
+                elif transfer_tensors.resident:
+                    self.fp8_resident_producer.initialize_tensors(transfer_tensors.resident, step=step)
+                if transfer_tensors.checkpoint:
+                    self.update_staged_sources(transfer_tensors.checkpoint)
+            del transfer_tensors
+        else:
+            self.initialize_transfer(model)
         if self.config.delta_mode == "xor":
             delta_available = torch.tensor(
                 delta_update is not None,
                 dtype=torch.uint8,
                 device=torch.device("cuda", torch.cuda.current_device()),
             )
-            dist.all_reduce(delta_available, op=dist.ReduceOp.MIN)
+            availability_op = dist.ReduceOp.MAX if self.fp8_resident_producer is not None else dist.ReduceOp.MIN
+            dist.all_reduce(delta_available, op=availability_op)
             if bool(delta_available.item()):
-                assert delta_update is not None
+                if self.fp8_resident_producer is None:
+                    assert delta_update is not None
                 self.broadcast_delta(delta_update, step, ready_runs)
                 return
             reason = None
@@ -525,6 +650,11 @@ class NIXLWeightBroadcast(WeightBroadcast):
         self.broadcast_full(step, ready_runs)
 
     def broadcast_full(self, step: int, ready_runs: list[int], *, reason: str | None = None) -> None:
+        if not self.full_transfer_resources_active:
+            raise RuntimeError(
+                "FP8 resident full-transfer resources were released after startup; "
+                "full recovery must rebuild the checkpoint snapshot and NIXL transfer plan"
+            )
         if self.world.is_master:
             assert self.trainer_table is not None
             self.update_session.publish(
@@ -559,10 +689,7 @@ class NIXLWeightBroadcast(WeightBroadcast):
             if group >= self.staging_buffer_count:
                 self.finish_staging_buffer_transfer(step, group - self.staging_buffer_count)
 
-            if self.is_serving_rank:
-                for shard in self.staged_shards_by_group.get(group, ()):
-                    shard.copy_to_staging()
-                torch.cuda.synchronize()
+            self.stage_full_group(group)
             dist.barrier()
             if self.world.is_master:
                 self.publish_group_ready(step, group)
@@ -581,17 +708,15 @@ class NIXLWeightBroadcast(WeightBroadcast):
             self.multi_run_manager.ready_to_update[run_index] = False
         reason_suffix = f" ({reason})" if reason is not None else ""
         self.logger.info(
-            f"NIXL+ModelExpress full policy v{step} synchronized in {time.perf_counter() - start:.2f}s"
-            f"{reason_suffix}"
+            f"NIXL+ModelExpress full policy v{step} synchronized in {time.perf_counter() - start:.2f}s{reason_suffix}"
         )
+        if self.fp8_resident_producer is not None and self.config.delta_mode == "xor":
+            self.release_full_transfer_resources()
 
     def build_local_delta_manifest(self, update: DeltaUpdate) -> NIXLDeltaManifest:
         groups = build_local_delta_groups(update, self.transfer_group_names)
         frame_payloads = {payload.data_ptr(): payload for payload in update.frame_payloads()}
-        group_sizes = [
-            sum(align_nvcomp_nbytes(frame.compressed_nbytes) for frame in frames)
-            for frames in groups
-        ]
+        group_sizes = [sum(align_nvcomp_nbytes(frame.compressed_nbytes) for frame in frames) for frames in groups]
         required_slot_bytes = max(group_sizes, default=0)
         self.ensure_delta_staging_arena(required_slot_bytes)
         assert self.delta_staging_arena is not None
@@ -638,6 +763,10 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 NIXLDeltaGroup(name=name, frames=tuple(frames))
                 for name, frames in zip(self.transfer_group_names, staged_groups, strict=True)
             ),
+            representation=self.config.delta_representation,
+            fp8_scale_format=(
+                self.config.delta_fp8_scale_format if self.config.delta_representation == "fp8_kernel" else ""
+            ),
         )
 
     def ensure_delta_staging_arena(self, slot_bytes: int) -> None:
@@ -655,8 +784,12 @@ class NIXLWeightBroadcast(WeightBroadcast):
             )
         self.delta_staging_registration = self.nixl_agent.register_tensor(self.delta_staging_arena)
 
-    def gather_delta_manifest(self, update: DeltaUpdate) -> NIXLDeltaManifest | None:
-        fragment = self.build_local_delta_manifest(update).encode() if self.is_serving_rank else None
+    def gather_delta_manifest(self, update: DeltaUpdate | None) -> NIXLDeltaManifest | None:
+        if update is None:
+            self.delta_group_copies = [[] for _ in self.transfer_group_names]
+        fragment = (
+            self.build_local_delta_manifest(update).encode() if self.is_serving_rank and update is not None else None
+        )
         gathered: list[bytes | None] | None = [None] * self.world.world_size if self.world.is_master else None
         dist.gather_object(fragment, gathered, dst=0)
         if gathered is None:
@@ -666,12 +799,12 @@ class NIXLWeightBroadcast(WeightBroadcast):
         )
 
     @torch.no_grad()
-    def broadcast_delta(self, update: DeltaUpdate, step: int, ready_runs: list[int]) -> None:
+    def broadcast_delta(self, update: DeltaUpdate | None, step: int, ready_runs: list[int]) -> None:
         if self.config.delta_mode != "xor":
             raise ValueError("received an XOR update while NIXL delta mode is disabled")
-        if update.step != step:
+        if update is not None and update.step != step:
             raise ValueError(f"delta step {update.step} does not match broadcast step {step}")
-        if update.base_step != self.last_broadcast_step:
+        if update is not None and update.base_step != self.last_broadcast_step:
             raise ValueError(
                 f"delta base step {update.base_step} does not match last broadcast {self.last_broadcast_step}"
             )
@@ -681,7 +814,9 @@ class NIXLWeightBroadcast(WeightBroadcast):
         if manifest is not None:
             compressed_nbytes = sum(frame.compressed_nbytes for group in manifest.groups for frame in group.frames)
             uncompressed_nbytes = sum(frame.uncompressed_nbytes for group in manifest.groups for frame in group.frames)
-            fallback_to_full = compressed_nbytes >= uncompressed_nbytes
+            fallback_to_full = (
+                self.config.delta_representation != "fp8_kernel" and compressed_nbytes >= uncompressed_nbytes
+            )
         decision = [fallback_to_full]
         dist.broadcast_object_list(decision, src=0)
         if decision[0]:

@@ -151,11 +151,20 @@ class SharedNIXLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
     delta_mode: Literal["none", "xor"] = "none"
     """Use exact GPU nvCOMP LZ4 XOR updates after the initial full NIXL transfer."""
 
+    delta_representation: Literal["source", "fp8_kernel"] = "source"
+    """NIXL wire representation: trainer source weights or TP-local FP8 resident tensors."""
+
+    delta_fp8_scale_format: Literal["float32", "ue8m0"] = "float32"
+    """Scale representation emitted with FP8 resident tensors."""
+
     delta_adam_bucket_mb: int = Field(512, ge=1)
     """Maximum local parameter MiB updated by each batched delta-aware AdamW call."""
 
     delta_pipeline_depth: int = Field(8, ge=1)
     """Maximum number of nvCOMP encode batches in flight."""
+
+    delta_cuda_graphs: bool = True
+    """Replay stable receiver-side XOR routes with CUDA graphs."""
 
 
 class SharedFileSystemWeightBroadcastConfig(BaseConfig):
@@ -362,26 +371,59 @@ class RLConfig(BaseConfig):
     def validate_xor_weight_transfer(self):
         if not isinstance(self.weight_broadcast, SharedNIXLWeightBroadcastConfig):
             return self
-        if self.weight_broadcast.delta_mode == "none":
+        fp8_kernel = self.weight_broadcast.delta_representation == "fp8_kernel"
+        if self.weight_broadcast.delta_mode == "none" and not fp8_kernel:
             return self
         if self.inference is None:
-            raise ValueError("weight_broadcast.delta_mode='xor' requires an inference config.")
-        if self.model is None or self.model.vlm is not None:
-            raise ValueError("weight_broadcast.delta_mode='xor' currently supports text-only models.")
-        if self.trainer.optim.type != "adamw":
+            raise ValueError("FP8-kernel or XOR weight transfer requires an inference config.")
+        if self.trainer.model.vlm is not None:
+            raise ValueError("FP8-kernel and XOR weight transfer currently support text-only models.")
+        if self.weight_broadcast.delta_mode == "xor" and self.trainer.optim.type != "adamw":
             raise ValueError("weight_broadcast.delta_mode='xor' currently requires trainer.optim.type='adamw'.")
         if self.trainer.max_concurrent_runs != 1:
-            raise ValueError("weight_broadcast.delta_mode='xor' currently requires max_concurrent_runs=1.")
-        if self.inference.model.dtype != self.trainer.model.optimization_dtype:
+            raise ValueError("FP8-kernel and XOR weight transfer currently require max_concurrent_runs=1.")
+        if (
+            self.weight_broadcast.delta_mode == "xor"
+            and not fp8_kernel
+            and (self.trainer.model.quantization is not None or self.inference.quantization is not None)
+        ):
+            raise ValueError("source-representation XOR does not support quantized models.")
+        if (
+            self.weight_broadcast.delta_mode == "xor"
+            and not fp8_kernel
+            and self.inference.model.dtype != self.trainer.model.optimization_dtype
+        ):
             raise ValueError(
                 "weight_broadcast.delta_mode='xor' requires inference.model.dtype to exactly match "
                 "trainer.model.optimization_dtype."
             )
-        if self.trainer.model.quantization is not None or self.inference.quantization is not None:
-            raise ValueError("weight_broadcast.delta_mode='xor' does not support quantized models.")
+        if fp8_kernel:
+            if self.trainer.model.impl != "custom":
+                raise ValueError("FP8-kernel transfer requires trainer.model.impl='custom'.")
+            if self.inference.quantization is not None:
+                raise ValueError(
+                    "FP8-kernel transfer currently requires a pre-quantized FP8 inference checkpoint, "
+                    "not inference.quantization online conversion."
+                )
+            if self.weight_broadcast.delta_mode == "xor" and (
+                "Qwen3" not in self.trainer.model.name
+                or "A3B" in self.trainer.model.name
+                or "A22B" in self.trainer.model.name
+            ):
+                raise ValueError(
+                    "resident FP8 XOR currently supports dense Qwen3 models; other architectures "
+                    "need an explicit TP-local vLLM resident converter."
+                )
+            if self.weight_broadcast.delta_mode == "xor" and self.inference.parallel.dp != 1:
+                raise ValueError("resident FP8 XOR currently requires inference.parallel.dp=1.")
+            if self.weight_broadcast.delta_mode == "xor" and self.weight_broadcast.delta_fp8_scale_format != "float32":
+                raise ValueError(
+                    "resident FP8 XOR currently requires delta_fp8_scale_format='float32'; "
+                    "vLLM may deterministically convert it to its selected resident scale layout."
+                )
         if self.trainer.model.dp_replicate != 1 or self.trainer.model.cp != 1:
             raise ValueError(
-                "weight_broadcast.delta_mode='xor' currently requires trainer.model.dp_replicate=1 and cp=1."
+                "FP8-kernel and XOR weight transfer currently require trainer.model.dp_replicate=1 and cp=1."
             )
         return self
 
@@ -446,8 +488,11 @@ class RLConfig(BaseConfig):
                 transport_config = dict(
                     session_id=self.weight_broadcast.session_id,
                     delta_mode=self.weight_broadcast.delta_mode,
+                    delta_representation=self.weight_broadcast.delta_representation,
+                    delta_fp8_scale_format=self.weight_broadcast.delta_fp8_scale_format,
                     delta_adam_bucket_mb=self.weight_broadcast.delta_adam_bucket_mb,
                     delta_pipeline_depth=self.weight_broadcast.delta_pipeline_depth,
+                    delta_cuda_graphs=self.weight_broadcast.delta_cuda_graphs,
                 )
                 trainer_config_type = TrainerNIXLWeightBroadcastConfig
                 orchestrator_config_type = OrchestratorNIXLWeightBroadcastConfig

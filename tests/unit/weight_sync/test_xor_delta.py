@@ -4,7 +4,8 @@ import pytest
 import torch
 from torch import nn
 
-from prime_rl.trainer.delta_adamw import DeltaAdamW
+from prime_rl.trainer.delta_adamw import BucketedAdamW, DeltaAdamW
+from prime_rl.weight_sync.fp8 import FP8ResidentDeltaState, xor_tensor_bytes
 from prime_rl.weight_sync.xor_delta import (
     DeltaEncoder,
     NvcompLZ4Codec,
@@ -13,6 +14,34 @@ from prime_rl.weight_sync.xor_delta import (
     integer_view,
     packed_delta_nbytes,
 )
+
+
+def test_fp8_resident_delta_state_applies_byte_exactly():
+    old_weight = torch.tensor([[1.0, -2.0], [3.0, 4.0]], dtype=torch.float8_e4m3fn)
+    new_weight = torch.tensor([[1.0, -1.5], [3.5, 4.0]], dtype=torch.float8_e4m3fn)
+    old_scale = torch.tensor([[0.25]], dtype=torch.float32)
+    new_scale = torch.tensor([[0.5]], dtype=torch.float32)
+    old_packed = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+    new_packed = torch.tensor([[1, 8], [3, 9]], dtype=torch.int32)
+    state = FP8ResidentDeltaState()
+    state.initialize(
+        3,
+        {"layer.weight": old_weight, "layer.weight_scale_inv": old_scale, "layer.marlin": old_packed},
+    )
+
+    _snapshot, deltas = state.advance(
+        base_step=3,
+        step=4,
+        tensors={"layer.weight": new_weight, "layer.weight_scale_inv": new_scale, "layer.marlin": new_packed},
+    )
+
+    restored_weight = xor_tensor_bytes(old_weight, deltas["layer.weight"])
+    restored_scale = xor_tensor_bytes(old_scale, deltas["layer.weight_scale_inv"])
+    restored_packed = xor_tensor_bytes(old_packed, deltas["layer.marlin"])
+    assert torch.equal(restored_weight.view(torch.uint8), new_weight.view(torch.uint8))
+    assert torch.equal(restored_scale.view(torch.uint8), new_scale.view(torch.uint8))
+    assert torch.equal(restored_packed.view(torch.uint8), new_packed.view(torch.uint8))
+
 
 pytestmark = [pytest.mark.gpu]
 
@@ -169,6 +198,46 @@ def test_delta_adamw_matches_adamw_and_emits_exact_parameter_xor(dtype):
         assert torch.equal(delta_state["exp_avg_sq"], reference_state["exp_avg_sq"])
 
 
+def test_bucketed_adamw_matches_adamw_byte_exactly():
+    device = torch.device("cuda", torch.cuda.current_device())
+    reference = nn.Sequential(
+        nn.Linear(32, 32, bias=False, dtype=torch.bfloat16, device=device),
+        nn.Linear(32, 32, dtype=torch.bfloat16, device=device),
+    )
+    bucketed_model = nn.Sequential(
+        nn.Linear(32, 32, bias=False, dtype=torch.bfloat16, device=device),
+        nn.Linear(32, 32, dtype=torch.bfloat16, device=device),
+    )
+    bucketed_model.load_state_dict(reference.state_dict())
+    reference_optimizer = torch.optim.AdamW(reference.parameters(), lr=1e-3, weight_decay=0.1)
+    bucketed_optimizer = BucketedAdamW(
+        params=list(bucketed_model.named_parameters()),
+        lr=1e-3,
+        weight_decay=0.1,
+        adam_bucket_bytes=2048,
+    )
+
+    for reference_parameter, bucketed_parameter in zip(
+        reference.parameters(), bucketed_model.parameters(), strict=True
+    ):
+        gradient = torch.randn_like(reference_parameter)
+        reference_parameter.grad = gradient.clone()
+        bucketed_parameter.grad = gradient.clone()
+
+    reference_optimizer.step()
+    bucketed_optimizer.step()
+
+    for bucketed_parameter, reference_parameter in zip(
+        bucketed_model.parameters(), reference.parameters(), strict=True
+    ):
+        assert torch.equal(_bits(bucketed_parameter), _bits(reference_parameter))
+        bucketed_state = bucketed_optimizer.state[bucketed_parameter]
+        reference_state = reference_optimizer.state[reference_parameter]
+        assert torch.equal(bucketed_state["step"], reference_state["step"])
+        assert torch.equal(bucketed_state["exp_avg"], reference_state["exp_avg"])
+        assert torch.equal(bucketed_state["exp_avg_sq"], reference_state["exp_avg_sq"])
+
+
 def test_encoder_rejects_unsupported_dtype_and_nonconsecutive_steps():
     device = torch.device("cuda", torch.cuda.current_device())
     codec = NvcompLZ4Codec(device)
@@ -177,7 +246,7 @@ def test_encoder_rejects_unsupported_dtype_and_nonconsecutive_steps():
 
     encoder = DeltaEncoder(base_step=1, step=2, codec=codec)
     with pytest.raises(TypeError, match="supports"):
-        encoder.append("weight", torch.zeros(2, dtype=torch.int32, device=device))
+        encoder.append("weight", torch.zeros(2, dtype=torch.int64, device=device))
 
     with pytest.raises(ValueError, match="requires CUDA tensors"):
         encoder.append("weight", torch.zeros(2, dtype=torch.bfloat16))

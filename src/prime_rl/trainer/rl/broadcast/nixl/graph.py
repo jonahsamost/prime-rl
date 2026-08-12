@@ -53,7 +53,7 @@ SUPPORTED_OPS: dict[Any, str] = {
     torch.Tensor.half: "half",
     torch.Tensor.bfloat16: "bfloat16",
 }
-_SUPPORTED_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
+_SUPPORTED_DTYPES = (torch.uint8, torch.float8_e4m3fn, torch.bfloat16, torch.float16, torch.float32)
 
 
 class UnsupportedOpError(NotImplementedError):
@@ -239,7 +239,7 @@ class LazyWeight(torch.Tensor):
             )
         if self.dtype not in _SUPPORTED_DTYPES or destination.dtype not in _SUPPORTED_DTYPES:
             raise UnsupportedOpError(
-                f"NIXL lazy copies only support BF16/FP16/FP32 values, got "
+                f"NIXL lazy copies only support FP8/BF16/FP16/FP32 values, got "
                 f"source={self.dtype}, destination={destination.dtype} for {self._source_name!r}"
             )
 
@@ -294,7 +294,7 @@ class LazyWeight(torch.Tensor):
         if isinstance(result, torch.Tensor):
             if result.dtype not in _SUPPORTED_DTYPES:
                 raise UnsupportedOpError(
-                    f"NIXL lazy replay only supports BF16/FP16/FP32 values, got {result.dtype} "
+                    f"NIXL lazy replay only supports FP8/BF16/FP16/FP32 values, got {result.dtype} "
                     f"after {op_name!r} on {source._source_name!r}"
                 )
             return source._child(operation)
@@ -346,12 +346,13 @@ def make_hf_lazy_weights(
         for tensor in group.tensors
     }
 
-    # TODO(matej): Figure out how to avoid depending on trainer code here.
-    from prime_rl.trainer.models import get_custom_causal_lm_cls
-    from prime_rl.trainer.models.conversion_ops import apply_prime_to_hf
+    if table.representation == "source":
+        # TODO(matej): Figure out how to avoid depending on trainer code here.
+        from prime_rl.trainer.models import get_custom_causal_lm_cls
+        from prime_rl.trainer.models.conversion_ops import apply_prime_to_hf
 
-    model_cls = get_custom_causal_lm_cls(hf_config)
-    apply_prime_to_hf(state, model_cls.conversion_chain(hf_config))
+        model_cls = get_custom_causal_lm_cls(hf_config)
+        apply_prime_to_hf(state, model_cls.conversion_chain(hf_config))
 
     # AutoWeightsLoader groups adjacent names by module prefix. Stable sorting
     # matches normal checkpoint iterators and keeps every expert group intact.

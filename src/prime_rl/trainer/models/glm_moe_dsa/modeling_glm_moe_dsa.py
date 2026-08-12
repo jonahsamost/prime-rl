@@ -152,9 +152,18 @@ class GlmMoeDsaPreTrainedModel(PreTrainedModelPrimeRL):
 
     @classmethod
     def convert_layer_to_vllm_kernel(
-        cls, state_dict: dict[str, Tensor], layer_idx: int, quantize_fp8: bool = False
+        cls,
+        state_dict: dict[str, Tensor],
+        layer_idx: int,
+        quantize_fp8: bool = False,
+        fp8_scale_format: str | None = None,
     ) -> dict[str, Tensor]:
-        return convert_tt_layer_to_vllm_kernel(state_dict, layer_idx, quantize_fp8=quantize_fp8)
+        return convert_tt_layer_to_vllm_kernel(
+            state_dict,
+            layer_idx,
+            quantize_fp8=quantize_fp8,
+            fp8_scale_format=fp8_scale_format,
+        )
 
 
 @auto_docstring

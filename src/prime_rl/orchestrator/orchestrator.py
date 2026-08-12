@@ -328,6 +328,9 @@ class Orchestrator:
                 config.weight_broadcast.inference_world_size,
                 config.weight_broadcast.session_id,
                 config.weight_broadcast.delta_mode,
+                config.weight_broadcast.delta_representation,
+                config.weight_broadcast.delta_fp8_scale_format,
+                config.weight_broadcast.delta_cuda_graphs,
             )
             self.model_express = ModelExpressSession(
                 client=MxClient(server_url=f"{config.weight_broadcast.host}:{config.weight_broadcast.port}"),

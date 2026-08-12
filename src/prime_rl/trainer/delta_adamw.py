@@ -28,7 +28,82 @@ def _canonical_parameter_name(name: str) -> str:
     return name.replace(_CHECKPOINT_WRAPPER_PREFIX, "")
 
 
-class DeltaAdamW(AdamW):
+class BucketedAdamW(AdamW):
+    """AdamW with foreach temporaries bounded to one parameter bucket."""
+
+    def __init__(
+        self,
+        params: Iterable[tuple[str, nn.Parameter]],
+        *,
+        adam_bucket_bytes: int = _DEFAULT_ADAM_BUCKET_BYTES,
+        **kwargs: Any,
+    ) -> None:
+        if adam_bucket_bytes <= 0:
+            raise ValueError(f"adam_bucket_bytes must be positive, got {adam_bucket_bytes}")
+        named_params = [
+            (_canonical_parameter_name(name), parameter) for name, parameter in params if parameter.requires_grad
+        ]
+        names = [name for name, _ in named_params]
+        if len(names) != len(set(names)):
+            raise ValueError("parameter names are not unique after removing checkpoint-wrapper prefixes")
+        super().__init__([parameter for _, parameter in named_params], **kwargs)
+        self._parameter_names = {id(parameter): name for name, parameter in named_params}
+        self._adam_bucket_bytes = adam_bucket_bytes
+
+    @_use_grad_for_differentiable
+    def step(self, closure: Callable[[], float] | None = None):
+        if hasattr(self, "_accelerator_graph_capture_health_check"):
+            self._accelerator_graph_capture_health_check()
+        else:
+            self._cuda_graph_capture_health_check()
+
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            params_with_grad: list[Tensor] = []
+            grads: list[Tensor] = []
+            exp_avgs: list[Tensor] = []
+            exp_avg_sqs: list[Tensor] = []
+            max_exp_avg_sqs: list[Tensor] = []
+            state_steps: list[Tensor] = []
+
+            has_complex = self._init_group(
+                group,
+                params_with_grad,
+                grads,
+                exp_avgs,
+                exp_avg_sqs,
+                max_exp_avg_sqs,
+                state_steps,
+            )
+            if has_complex:
+                raise TypeError("bucketed AdamW does not support complex parameters")
+
+            for bucket_start, bucket_end, _bucket_bytes in _parameter_buckets(
+                params_with_grad,
+                self._adam_bucket_bytes,
+                self._parameter_names,
+            ):
+                _adam_bucket(
+                    group,
+                    params_with_grad,
+                    grads,
+                    exp_avgs,
+                    exp_avg_sqs,
+                    max_exp_avg_sqs,
+                    state_steps,
+                    bucket_start,
+                    bucket_end,
+                    grad_scale=getattr(self, "grad_scale", None),
+                    found_inf=getattr(self, "found_inf", None),
+                )
+        return loss
+
+
+class DeltaAdamW(BucketedAdamW):
     """AdamW that records each parameter's exact bitwise XOR immediately after updating it."""
 
     def __init__(
@@ -39,21 +114,11 @@ class DeltaAdamW(AdamW):
         delta_pipeline_depth: int = 8,
         **kwargs: Any,
     ) -> None:
-        if delta_adam_bucket_bytes <= 0:
-            raise ValueError(f"delta_adam_bucket_bytes must be positive, got {delta_adam_bucket_bytes}")
-        named_params = [
-            (_canonical_parameter_name(name), parameter) for name, parameter in params if parameter.requires_grad
-        ]
-        names = [name for name, _ in named_params]
-        if len(names) != len(set(names)):
-            raise ValueError("parameter names are not unique after removing checkpoint-wrapper prefixes")
-        super().__init__([parameter for _, parameter in named_params], **kwargs)
-        self._parameter_names = {id(parameter): name for name, parameter in named_params}
+        super().__init__(params, adam_bucket_bytes=delta_adam_bucket_bytes, **kwargs)
         self._encoder: DeltaEncoder | None = None
         self._pending_update: DeltaUpdate | None = None
-        self._delta_adam_bucket_bytes = delta_adam_bucket_bytes
         self._delta_pipeline_depth = delta_pipeline_depth
-        device = local_tensor(named_params[0][1]).device
+        device = local_tensor(self.param_groups[0]["params"][0]).device
         self._delta_codec = NvcompLZ4Codec(device)
 
     def begin_delta(self, *, base_step: int, step: int) -> None:
@@ -102,8 +167,6 @@ class DeltaAdamW(AdamW):
                 exp_avg_sqs: list[Tensor] = []
                 max_exp_avg_sqs: list[Tensor] = []
                 state_steps: list[Tensor] = []
-                beta1, beta2 = group["betas"]
-
                 has_complex = self._init_group(
                     group,
                     params_with_grad,
@@ -118,7 +181,7 @@ class DeltaAdamW(AdamW):
 
                 for bucket_start, bucket_end, _bucket_bytes in _parameter_buckets(
                     params_with_grad,
-                    self._delta_adam_bucket_bytes,
+                    self._adam_bucket_bytes,
                     self._parameter_names,
                 ):
                     bucket_parameters = params_with_grad[bucket_start:bucket_end]
@@ -150,28 +213,18 @@ class DeltaAdamW(AdamW):
                         old_values.append(old_value)
                         old_offset += local_parameter.numel()
 
-                    adam(
-                        bucket_parameters,
-                        grads[bucket_start:bucket_end],
-                        exp_avgs[bucket_start:bucket_end],
-                        exp_avg_sqs[bucket_start:bucket_end],
-                        max_exp_avg_sqs[bucket_start:bucket_end] if group["amsgrad"] else [],
-                        state_steps[bucket_start:bucket_end],
-                        amsgrad=group["amsgrad"],
-                        has_complex=False,
-                        beta1=beta1,
-                        beta2=beta2,
-                        lr=group["lr"],
-                        weight_decay=group["weight_decay"],
-                        eps=group["eps"],
-                        maximize=group["maximize"],
-                        foreach=group["foreach"],
-                        capturable=group["capturable"],
-                        differentiable=group["differentiable"],
-                        fused=group["fused"],
+                    _adam_bucket(
+                        group,
+                        params_with_grad,
+                        grads,
+                        exp_avgs,
+                        exp_avg_sqs,
+                        max_exp_avg_sqs,
+                        state_steps,
+                        bucket_start,
+                        bucket_end,
                         grad_scale=getattr(self, "grad_scale", None),
                         found_inf=getattr(self, "found_inf", None),
-                        decoupled_weight_decay=group["decoupled_weight_decay"],
                     )
                     for current_value, old_value in zip(local_parameters, old_values, strict=True):
                         integer_view(old_value).bitwise_xor_(integer_view(current_value))
@@ -230,6 +283,45 @@ def _parameter_buckets(
         yield start, len(parameters), used
 
 
+def _adam_bucket(
+    group: dict[str, Any],
+    parameters: list[Tensor],
+    grads: list[Tensor],
+    exp_avgs: list[Tensor],
+    exp_avg_sqs: list[Tensor],
+    max_exp_avg_sqs: list[Tensor],
+    state_steps: list[Tensor],
+    start: int,
+    end: int,
+    *,
+    grad_scale: Tensor | None = None,
+    found_inf: Tensor | None = None,
+) -> None:
+    adam(
+        parameters[start:end],
+        grads[start:end],
+        exp_avgs[start:end],
+        exp_avg_sqs[start:end],
+        max_exp_avg_sqs[start:end] if group["amsgrad"] else [],
+        state_steps[start:end],
+        amsgrad=group["amsgrad"],
+        has_complex=False,
+        beta1=group["betas"][0],
+        beta2=group["betas"][1],
+        lr=group["lr"],
+        weight_decay=group["weight_decay"],
+        eps=group["eps"],
+        maximize=group["maximize"],
+        foreach=group["foreach"],
+        capturable=group["capturable"],
+        differentiable=group["differentiable"],
+        fused=group["fused"],
+        grad_scale=grad_scale,
+        found_inf=found_inf,
+        decoupled_weight_decay=group["decoupled_weight_decay"],
+    )
+
+
 def _parameter_shard_descriptor(parameter: Tensor) -> tuple[tuple[int, ...], int | None, int, int]:
     if not isinstance(parameter, DTensor):
         return tuple(parameter.shape), None, 0, 1
@@ -261,4 +353,4 @@ def _parameter_shard_descriptor(parameter: Tensor) -> tuple[tuple[int, ...], int
     )
 
 
-__all__ = ["DeltaAdamW"]
+__all__ = ["BucketedAdamW", "DeltaAdamW"]

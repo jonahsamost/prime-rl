@@ -116,28 +116,79 @@ type = "nixl"
 delta_mode = "xor"
 delta_adam_bucket_mb = 512
 delta_pipeline_depth = 8
+delta_cuda_graphs = true
 ```
 
 Use `configs/debug/weight-sync/qwen3-8b-fsdp4-tp2-nixl-xor-smoke.toml` for a
 dense NIXL smoke run and
 `configs/debug/weight-sync/mini-glm-moe-fsdp4-ep4-tp2-nixl-xor-smoke.toml` for
 the first MoE/EP smoke run.
+Use `configs/debug/weight-sync/qwen3-8b-fsdp4-tp2-nixl-fp8-xor-smoke.toml`
+for the producer-quantized FP8 kernel path on Hopper.
 Run the dense smoke for at least four steps both as configured and with
 `--weight-broadcast.delta-mode none`. The full-transfer baseline exercises the
 same rendezvous with less producer work between updates, making it the more
 sensitive check for consecutive-update handshake races.
 
-This mode requires a text-only model, AdamW, single-run training,
-`dp_replicate=1`, `cp=1`, and no trainer, inference, or transfer quantization.
-Trainer `optimization_dtype` and inference `model.dtype` must be the same
-explicit value: `bfloat16`, `float16`, or `float32`. Model loaders must route
+Source-representation XOR requires a text-only model, AdamW, single-run training,
+`dp_replicate=1`, `cp=1`, and no trainer or inference quantization. Trainer
+`optimization_dtype` and inference `model.dtype` must be the same explicit
+value: `bfloat16`, `float16`, or `float32`. Model loaders must route
 weights through same-dtype, bit-preserving operations; the NIXL worker validates
 the traced load graph before the first update. NIXL supports rank-aware TP/EP
 pulls and multi-node deployment. NCCL remains available for normal full-weight
 transfer but does not implement XOR updates. Fake-data runs skip weight
 transfer and use standard AdamW even when delta mode is configured.
+
+For FP8 rollout inference, select the FP8 resident-kernel transfer representation:
+
+```toml
+[inference.model]
+name = "Qwen/Qwen3-8B-FP8"
+
+[weight_broadcast]
+type = "nixl"
+delta_mode = "xor"
+delta_representation = "fp8_kernel"
+delta_fp8_scale_format = "float32"
+```
+
+This path uses AdamW with foreach operations scheduled in bounded
+`delta_adam_bucket_mb` buckets, avoiding model-shard-sized optimizer temporaries
+without recording redundant source-weight deltas. The initial update is loaded
+from producer-built FP8 checkpoint tensors. For later updates, each trainer rank owns a subset of
+layers and retains their uncompressed, TP-local vLLM resident tensors. It builds
+the next resident version with the pinned vLLM packing routines and compresses
+`bytes(R_old) XOR bytes(R_new)`, including packed Marlin `int32` weights and
+scale tensors. Frames are tagged for one inference rank, which XORs them directly
+into its resident parameters. The receiver does not retain a checkpoint shadow
+or rerun layer post-processing. Resident FP8 XOR currently supports dense Qwen3;
+adding another architecture requires an explicit converter for its vLLM fusion,
+TP ownership, and selected kernel layout. Trainer and inference GPUs must select
+the same vLLM FP8 kernel backend; use homogeneous GPU architectures and matching
+vLLM kernel-related environment settings. Inference DP is currently unsupported
+for this representation. Keep `delta_fp8_scale_format = "float32"`; vLLM's
+selected kernel adapter performs any deterministic resident scale conversion.
+Set `delta_mode = "none"` with the same `fp8_kernel` representation for a
+full-snapshot baseline that transfers the exact same weights and scales.
+The inference checkpoint must contain the matching FP8 scheme and scale format;
+online `inference.quantization` conversion is not accepted because its loader
+starts from BF16 rather than producer-generated FP8 checkpoint tensors. Keep
+`delta_representation = "source"` for unquantized inference.
 The startup update is a normal full checkpoint transfer;
-later consecutive versions are source-layout XOR updates. AdamW snapshots and
+later consecutive versions are XOR updates in the selected representation. Once
+all receivers and the orchestrator acknowledge the startup FP8 XOR policy, the
+trainer deregisters and releases its checkpoint-format source tensors and full-sync
+staging arenas. It retains only the distributed TP-local resident kernel
+snapshot. The trainer logs the checkpoint and staging sizes plus allocated and
+device-free CUDA memory on each rank. A later full recovery is rejected until those resources and the transfer
+plan are explicitly rebuilt; `delta_mode = "none"` retains them for every update.
+FP8-kernel transfer uses bucketed AdamW and one reusable full-transfer staging
+buffer in both XOR and full baselines so changing the transfer protocol does not
+change optimizer scheduling or startup memory. `delta_pipeline_depth` still
+controls steady-state delta encoding.
+For
+source-representation XOR, AdamW snapshots and
 updates bounded local parameter buckets, invokes one foreach-capable AdamW update per
 bucket, and batch-compresses that bucket's parameter XOR tensors with nvCOMP LZ4
 without leaving CUDA memory. The compressed tensor streams are packed into one
@@ -145,7 +196,14 @@ CUDA `uint8` payload per trainer rank. NIXL copies frames into reusable
 registered arenas on their owning trainer ranks; rank zero publishes metadata
 only, and each inference worker pulls only frames required by its traced TP/EP
 routes. Receivers pull and decode the next bounded transfer group on a side
-stream while applying the current group. ModelExpress handles initial peer
+stream while applying the current group. Stable direct XOR route segments are
+captured into receiver-side CUDA graphs during the first delta update and
+replayed on later updates; transformed routes remain eager. The aggregate
+receiver metric reports `graphs=<captures>/<replays>` and
+`routes=<graphed>/<eager>`. The first delta is intentionally serialized while
+graphs are captured, so exclude it from timing averages. Set
+`--weight-broadcast.delta-cuda-graphs false` for a same-code eager XOR control
+run. ModelExpress handles initial peer
 discovery, policy metadata, and policy-level pause/update/resume coordination.
 After discovery, per-group READY and ACK messages use generation-tagged NIXL
 notifications instead of ModelExpress status polling. The generation includes
