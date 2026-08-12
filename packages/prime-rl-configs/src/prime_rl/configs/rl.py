@@ -502,7 +502,11 @@ class RLConfig(BaseConfig):
             self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig()
             self.orchestrator.weight_broadcast = OrchestratorFileSystemWeightBroadcastConfig()
         if self.inference is not None:
-            self.inference.weight_broadcast = InferenceWeightBroadcastConfig(type=self.weight_broadcast.type)
+            delta_mode = self.weight_broadcast.delta_mode if self.weight_broadcast.type == "nixl" else "none"
+            self.inference.weight_broadcast = InferenceWeightBroadcastConfig(
+                type=self.weight_broadcast.type,
+                delta_mode=delta_mode,
+            )
 
         validate_shared_weight_broadcast(self.trainer, self.orchestrator, self.inference)
 

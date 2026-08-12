@@ -85,6 +85,9 @@ class WeightBroadcastConfig(BaseConfig):
     type: Literal["nccl", "filesystem", "nixl"] = "filesystem"
     """Weight broadcast transport."""
 
+    delta_mode: Literal["none", "xor"] = "none"
+    """Select the XOR-capable NIXL worker extension when configured."""
+
 
 class CPUOffloadTier(BaseConfig):
     num_bytes: int = Field(..., gt=0)

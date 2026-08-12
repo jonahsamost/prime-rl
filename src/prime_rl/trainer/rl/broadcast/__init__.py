@@ -7,7 +7,7 @@ from prime_rl.trainer.parallel_dims import ParallelDims
 from prime_rl.trainer.rl.broadcast.base import WeightBroadcast
 from prime_rl.trainer.rl.broadcast.filesystem import FileSystemWeightBroadcast
 from prime_rl.trainer.rl.broadcast.nccl import NCCLWeightBroadcast
-from prime_rl.trainer.rl.broadcast.nixl import NIXLWeightBroadcast
+from prime_rl.trainer.rl.broadcast.nixl import NIXLWeightBroadcast, NIXLXorWeightBroadcast
 
 
 def setup_weight_broadcast(
@@ -21,6 +21,7 @@ def setup_weight_broadcast(
     elif config.type == "filesystem":
         return FileSystemWeightBroadcast(output_dir, config, lora_config)
     elif config.type == "nixl":
-        return NIXLWeightBroadcast(output_dir, config, parallel_dims)
+        broadcaster = NIXLXorWeightBroadcast if config.delta_mode == "xor" else NIXLWeightBroadcast
+        return broadcaster(output_dir, config, parallel_dims)
     else:
         raise ValueError(f"Invalid weight broadcast type: {config.type}")

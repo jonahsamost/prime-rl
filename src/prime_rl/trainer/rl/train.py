@@ -9,7 +9,7 @@ from datetime import timedelta
 
 from prime_rl.trainer.models.layers.attn import substitute_ring_attn
 from prime_rl.trainer.rl.broadcast import setup_weight_broadcast
-from prime_rl.trainer.rl.broadcast.nixl import NIXLWeightBroadcast
+from prime_rl.trainer.rl.broadcast.nixl import NIXLXorWeightBroadcast
 from prime_rl.utils.act_offloading import maybe_activation_offloading
 import torch
 import torch.distributed as dist
@@ -643,7 +643,7 @@ def train(config: TrainerConfig):
             if not broadcast_unused:
                 broadcast_weights_start_time = time.perf_counter()
                 if delta_update is not None:
-                    if not isinstance(weight_broadcast, NIXLWeightBroadcast):
+                    if not isinstance(weight_broadcast, NIXLXorWeightBroadcast):
                         raise TypeError("XOR delta updates require NIXL weight broadcast")
                     weight_broadcast.broadcast_weights(model, step=progress.step, delta_update=delta_update)
                     delta_update = None

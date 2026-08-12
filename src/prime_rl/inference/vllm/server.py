@@ -72,6 +72,12 @@ WORKER_EXTENSION_CLS = {
 }
 
 
+def worker_extension_cls(config: InferenceConfig) -> str:
+    if config.weight_broadcast.type == "nixl" and config.weight_broadcast.delta_mode == "xor":
+        return "prime_rl.inference.vllm.worker.nixl_xor.NIXLXorWeightUpdateWorker"
+    return WORKER_EXTENSION_CLS[config.weight_broadcast.type]
+
+
 @router.post("/pause")
 async def pause(request: Request):
     logger.debug("Received /pause request (mode=keep, clear_cache=False)")
@@ -246,7 +252,7 @@ def server(config: InferenceConfig, vllm_extra: dict[str, Any] | None = None):
     validate_parsed_serve_args(args)
 
     # Set the worker extension class based on the broadcast backend
-    args.worker_extension_cls = WORKER_EXTENSION_CLS[config.weight_broadcast.type]
+    args.worker_extension_cls = worker_extension_cls(config)
 
     if args.headless or args.api_server_count < 1:
         run_headless(args)

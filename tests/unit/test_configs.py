@@ -569,6 +569,7 @@ def test_xor_weight_transfer_propagates_to_nixl_components(dtype):
     assert config.orchestrator.weight_broadcast.delta_adam_bucket_mb == 192
     assert config.orchestrator.weight_broadcast.delta_pipeline_depth == 3
     assert config.orchestrator.weight_broadcast.delta_cuda_graphs is False
+    assert config.inference.weight_broadcast.delta_mode == "xor"
 
 
 def test_nccl_weight_transfer_rejects_xor_configuration():
