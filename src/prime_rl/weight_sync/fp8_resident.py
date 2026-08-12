@@ -52,6 +52,52 @@ def build_qwen3_fp8_resident_layer(
     if missing:
         raise ValueError(f"Qwen3 FP8 resident conversion is missing tensors: {sorted(missing)}")
 
+    output = build_qwen3_fp8_resident_attention(
+        relative,
+        prefix=prefix,
+        config=config,
+        tp_size=tp_size,
+        scale_format=scale_format,
+    )
+    for tp_rank in range(tp_size):
+        gate = _row_shard(relative["mlp.gate_proj.weight"], tp_rank, tp_size)
+        up = _row_shard(relative["mlp.up_proj.weight"], tp_rank, tp_size)
+
+        linears = {
+            "mlp.gate_up_proj": torch.cat((gate, up), dim=0),
+            "mlp.down_proj": _column_shard(relative["mlp.down_proj.weight"], tp_rank, tp_size),
+        }
+        for name, weight in linears.items():
+            resident_weight, resident_scale = _pack_fp8_linear(weight, scale_format)
+            full_name = f"{prefix}{name}"
+            output[resident_tensor_name(tp_rank, f"{full_name}.weight")] = resident_weight
+            output[resident_tensor_name(tp_rank, f"{full_name}.weight_scale_inv")] = resident_scale
+
+        for name, value in relative.items():
+            if name not in expected:
+                output[resident_tensor_name(tp_rank, prefix + name)] = value.detach().contiguous()
+    return output
+
+
+@torch.no_grad()
+def build_qwen3_fp8_resident_attention(
+    relative: dict[str, Tensor],
+    *,
+    prefix: str,
+    config: object,
+    tp_size: int,
+    scale_format: FP8ScaleFormat,
+) -> dict[str, Tensor]:
+    expected = {
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+    }
+    missing = expected - relative.keys()
+    if missing:
+        raise ValueError(f"Qwen3 FP8 resident attention conversion is missing tensors: {sorted(missing)}")
+
     num_heads = int(getattr(config, "num_attention_heads"))
     num_kv_heads = int(getattr(config, "num_key_value_heads"))
     configured_head_dim = getattr(config, "head_dim", None)
@@ -66,24 +112,15 @@ def build_qwen3_fp8_resident_layer(
         q = _head_shard(relative["self_attn.q_proj.weight"], num_heads, tp_rank, tp_size, head_dim)
         k = _kv_head_shard(relative["self_attn.k_proj.weight"], num_kv_heads, tp_rank, tp_size, head_dim)
         v = _kv_head_shard(relative["self_attn.v_proj.weight"], num_kv_heads, tp_rank, tp_size, head_dim)
-        gate = _row_shard(relative["mlp.gate_proj.weight"], tp_rank, tp_size)
-        up = _row_shard(relative["mlp.up_proj.weight"], tp_rank, tp_size)
-
         linears = {
             "self_attn.qkv_proj": torch.cat((q, k, v), dim=0),
             "self_attn.o_proj": _column_shard(relative["self_attn.o_proj.weight"], tp_rank, tp_size),
-            "mlp.gate_up_proj": torch.cat((gate, up), dim=0),
-            "mlp.down_proj": _column_shard(relative["mlp.down_proj.weight"], tp_rank, tp_size),
         }
         for name, weight in linears.items():
             resident_weight, resident_scale = _pack_fp8_linear(weight, scale_format)
             full_name = f"{prefix}{name}"
             output[resident_tensor_name(tp_rank, f"{full_name}.weight")] = resident_weight
             output[resident_tensor_name(tp_rank, f"{full_name}.weight_scale_inv")] = resident_scale
-
-        for name, value in relative.items():
-            if name not in expected:
-                output[resident_tensor_name(tp_rank, prefix + name)] = value.detach().contiguous()
     return output
 
 
@@ -168,6 +205,7 @@ def _pack_fp8_marlin(weight: Tensor, scales: Tensor, source_dtype: torch.dtype) 
 
 
 __all__ = [
+    "build_qwen3_fp8_resident_attention",
     "build_qwen3_fp8_resident_layer",
     "parse_resident_tensor_name",
     "resident_tensor_name",

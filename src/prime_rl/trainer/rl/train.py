@@ -611,6 +611,7 @@ def train(config: TrainerConfig):
 
         # The delta-aware AdamW bounds snapshots by update bucket and releases
         # each bucket after nvCOMP has consumed its GPU-resident parameter XORs.
+        policy_update_start_time = time.perf_counter()
         delta_update: DeltaUpdate | None = None
         record_delta = delta_optimizer is not None
         if record_delta:
@@ -662,6 +663,7 @@ def train(config: TrainerConfig):
                 # Usually the broadcast will set this. If broadcast is skipped, we need to reset this here.
                 for idx in multi_run_manager.used_idxs:
                     multi_run_manager.ready_to_update[idx] = False
+        policy_update_time = time.perf_counter() - policy_update_start_time
 
         # Checkpoint the step we just finished (model = policy v{progress.step}).
         if config.max_concurrent_runs > 1:
@@ -723,7 +725,11 @@ def train(config: TrainerConfig):
             step_message += f" | Mismatch KL {tensor_stats['mismatch_kl/all/mean']:.4f}"
         if grad_norm is not None:
             step_message += f" | Grad. Norm {grad_norm:.4f}"
-        step_message += f" | LR {current_lr:.2e} | Throughput {throughput:.0f} tokens/s | MFU {mfu:.1f}% | Peak Mem. {peak_memory:.1f} GiB"
+        step_message += (
+            f" | LR {current_lr:.2e} | Throughput {throughput:.0f} tokens/s | MFU {mfu:.1f}%"
+            f" | Peak Mem. {peak_memory:.1f} GiB | Policy Update {policy_update_time:.2f}s"
+            f" | Weight Sync {broadcast_weights_time:.2f}s"
+        )
         if "max_vio/mean" in tensor_stats:
             step_message += f" | Max Vio {tensor_stats['max_vio/mean']:.4f}"
         if "routing_confidence/mean" in tensor_stats:
@@ -764,6 +770,7 @@ def train(config: TrainerConfig):
             "time/step": step_time,
             "time/wait_for_batch": wait_for_batch_time,
             "time/load_data": load_data_time,
+            "time/policy_update": policy_update_time,
             "time/broadcast_weights": broadcast_weights_time,
             "time/save_ckpt": save_ckpt_time,
             "time/forward_backward": forward_backward_time,

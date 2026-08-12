@@ -111,7 +111,7 @@ class FP8ResidentProducer:
                 continue
             checkpoint_layer = (
                 model.convert_layer_to_vllm_kernel(
-                    resolved,
+                    resolved.copy(),
                     layer_index,
                     quantize_fp8=True,
                     fp8_scale_format=self.scale_format,

@@ -1,19 +1,21 @@
-"""Experimental XOR-delta routing for vLLM weight loaders.
+"""Route XOR weight deltas through a vLLM model's normal weight loader.
 
-This module contains the receiver-side primitive for proving that a model's
-checkpoint loader is bit preserving.  It intentionally does not implement a
-transport, compression, optimizer integration, or quantized-weight support.
+Training checkpoints and vLLM models often store the same weights in different
+layouts. For example, vLLM may select a tensor-parallel shard or combine
+separate Q, K, and V weights into one parameter. Rather than reimplement those
+model-specific transformations, this module runs the model's existing weight
+loader with its destination parameters temporarily redirected to zeroed scratch
+tensors. The loader writes the source-layout delta into scratch in the layout
+expected by the live vLLM parameters. The live storage is then restored, and
+the routed scratch values can be XORed into it.
 
-The caller selects one bounded layer, temporarily routes source-layout values
-through the model's existing ``load_weights`` implementation into zeroed
-scratch storage, and then restores the live storage.  If the loader only
-performs same-dtype byte movement (slicing, concatenation into fused weights,
-TP selection, and copies), routing an XOR value produces the XOR value in the
-resident vLLM layout.
+Importantly, this is exact only when the weight loader preserves bits through operations
+such as copying, slicing, and concatenation. Casting, quantization, floating-
+point arithmetic, or any other value transformation can invalidate the XOR
+delta. Each supported model loader must therefore be verified with a byte-exact
+routing test.
 
-This is not safe for loaders that cast, quantize, perform floating-point
-arithmetic, or otherwise transform values. Support for a real model must be
-established by a byte-exact routing test before enabling it here.
+This module only performs and validates the routing and XOR.
 """
 
 from __future__ import annotations
@@ -154,6 +156,9 @@ def route_values_with_plan(
     plan: ParameterRoutingPlan,
     load_values: Callable[[], Any],
 ) -> list[DestinationDelta]:
+    # Temporarily redirect destination parameters to zeroed scratch storage, then
+    # run the normal weight loader to route source-layout XOR values into the
+    # model's packed/sharded destination layout without modifying live weights.
     original_data: list[torch.Tensor] = []
     scratch: list[torch.Tensor] = []
     for entry in plan.entries:
@@ -267,6 +272,9 @@ def _reject_distinct_shared_storage(
     parameter: nn.Parameter,
     storage_owners: dict[tuple[str, int | None, int], nn.Parameter],
 ) -> None:
+    # xor routing temporarily replaces each parameter's `.data` with independent scratch tensors
+    # this break the original storage relationship because overlapping views onto the same backing
+    # storage could produce incorrect deltas or xor the same bytes multiple times
     storage = parameter.untyped_storage()
     storage_key = (parameter.device.type, parameter.device.index, storage.data_ptr())
     previous = storage_owners.setdefault(storage_key, parameter)

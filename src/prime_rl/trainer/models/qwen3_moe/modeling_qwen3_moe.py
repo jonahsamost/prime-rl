@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
+from typing import Optional, Union, cast
 
 import torch
 from torch import Tensor, nn
@@ -144,6 +144,25 @@ class Qwen3MoePreTrainedModel(PreTrainedModelPrimeRL):
     @classmethod
     def conversion_chain(cls, config):
         return conversion_chain(config)
+
+    def convert_layer_to_vllm_resident(
+        self,
+        state_dict: dict[str, Tensor],
+        layer_idx: int,
+        *,
+        inference_tp_size: int,
+        fp8_scale_format: str,
+    ) -> dict[str, Tensor]:
+        from prime_rl.weight_sync.fp8 import FP8ScaleFormat
+        from prime_rl.weight_sync.fp8_moe_resident import build_qwen3_moe_fp8_resident_layer
+
+        return build_qwen3_moe_fp8_resident_layer(
+            state_dict,
+            layer_index=layer_idx,
+            config=self.config,
+            inference_world_size=inference_tp_size,
+            scale_format=cast(FP8ScaleFormat, fp8_scale_format),
+        )
 
 
 @auto_docstring

@@ -125,6 +125,22 @@ dense NIXL smoke run and
 the first MoE/EP smoke run.
 Use `configs/debug/weight-sync/qwen3-8b-fsdp4-tp2-nixl-fp8-xor-smoke.toml`
 for the producer-quantized FP8 kernel path on Hopper.
+Use `configs/debug/weight-sync/qwen3-30b-a3b-fsdp4-ep4-tp4-nixl-fp8-xor-smoke.toml`
+for Qwen3-MoE FP8 resident transfer with inference expert parallelism.
+Use `configs/debug/weight-sync/qwen3-30b-a3b-fsdp4-ep4-tp4-nixl-xor-benchmark.toml`
+for its eight-GPU BF16/source counterpart. For paired performance runs, keep
+`delta_adam_bucket_mb = 512` and `delta_pipeline_depth = 8`, run the same config
+with `delta_mode = "xor"` and `delta_mode = "none"`, and summarize the standard
+`<scenario>/{full,xor}` output tree with
+`uv run scripts/summarize_weight_sync_benchmarks.py <output-root>`. Trainer step
+logs include `Policy Update`, which spans the optimizer update, source-delta
+generation, FP8 resident conversion, and completed transfer. `Weight Sync`
+times the broadcast call itself; for FP8 that includes resident conversion and
+delta construction, while source-representation deltas have already been built
+by the optimizer. The broadcaster's
+`synchronized in` metric measures only the protocol portion after payload
+construction. Exclude policy v1 from paired averages because it captures the
+receiver CUDA graphs.
 Run the dense smoke for at least four steps both as configured and with
 `--weight-broadcast.delta-mode none`. The full-transfer baseline exercises the
 same rendezvous with less producer work between updates, making it the more
@@ -162,9 +178,13 @@ the next resident version with the pinned vLLM packing routines and compresses
 `bytes(R_old) XOR bytes(R_new)`, including packed Marlin `int32` weights and
 scale tensors. Frames are tagged for one inference rank, which XORs them directly
 into its resident parameters. The receiver does not retain a checkpoint shadow
-or rerun layer post-processing. Resident FP8 XOR currently supports dense Qwen3;
-adding another architecture requires an explicit converter for its vLLM fusion,
-TP ownership, and selected kernel layout. Trainer and inference GPUs must select
+or rerun layer post-processing. Resident FP8 XOR supports dense Qwen3 and
+Qwen3-MoE. Qwen3-MoE requires inference expert parallelism, partitions experts
+evenly across the inference world, and retains vLLM's fused `w13`/`w2` tensors
+and block scales on their owning EP ranks. Other architectures require an
+explicit converter for their vLLM fusion, TP/EP ownership, and selected kernel
+layout. Native FP8 Hopper kernels and vLLM's Marlin FP8 weight-only fallback on
+Ampere are supported. Trainer and inference GPUs must select
 the same vLLM FP8 kernel backend; use homogeneous GPU architectures and matching
 vLLM kernel-related environment settings. Inference DP is currently unsupported
 for this representation. Keep `delta_fp8_scale_format = "float32"`; vLLM's

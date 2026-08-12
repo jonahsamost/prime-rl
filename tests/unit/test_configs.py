@@ -616,6 +616,54 @@ def test_weight_transfer_accepts_fp8_kernel_representation(delta_mode):
     assert config.orchestrator.weight_broadcast.delta_fp8_scale_format == "float32"
 
 
+def test_weight_transfer_accepts_qwen3_moe_fp8_kernel_representation():
+    config = RLConfig.model_validate(
+        {
+            "weight_broadcast": {
+                "type": "nixl",
+                "delta_mode": "xor",
+                "delta_representation": "fp8_kernel",
+            },
+            "trainer": {"model": {"name": "Qwen/Qwen3-30B-A3B", "impl": "custom"}},
+            "orchestrator": {
+                "model": {"name": "Qwen/Qwen3-30B-A3B-FP8"},
+                "renderer": {"name": "default"},
+            },
+            "inference": {
+                "enable_expert_parallel": True,
+                "model": {"name": "Qwen/Qwen3-30B-A3B-FP8", "dtype": "bfloat16"},
+                "parallel": {"tp": 2, "dp": 1},
+            },
+            "deployment": {"type": "single_node", "num_train_gpus": 1, "num_infer_gpus": 2},
+        }
+    )
+
+    assert config.trainer.weight_broadcast.delta_representation == "fp8_kernel"
+    assert config.inference.enable_expert_parallel is True
+
+
+def test_weight_transfer_rejects_qwen3_moe_fp8_kernel_without_expert_parallel():
+    with pytest.raises(ValidationError, match="enable_expert_parallel"):
+        RLConfig.model_validate(
+            {
+                "weight_broadcast": {
+                    "type": "nixl",
+                    "delta_mode": "xor",
+                    "delta_representation": "fp8_kernel",
+                },
+                "trainer": {"model": {"name": "Qwen/Qwen3-30B-A3B", "impl": "custom"}},
+                "orchestrator": {
+                    "model": {"name": "Qwen/Qwen3-30B-A3B-FP8"},
+                    "renderer": {"name": "default"},
+                },
+                "inference": {
+                    "model": {"name": "Qwen/Qwen3-30B-A3B-FP8", "dtype": "bfloat16"},
+                    "parallel": {"tp": 1, "dp": 1},
+                },
+            }
+        )
+
+
 def test_source_xor_weight_transfer_rejects_quantization():
     with pytest.raises(ValidationError, match="source-representation XOR"):
         RLConfig.model_validate(

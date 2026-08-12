@@ -198,7 +198,8 @@ class NIXLWeightUpdateWorker(Worker):
         return plan
 
     def validate_transfer_plan(self, plan: WeightTransferPlan) -> None:
-        del plan
+        """Hook for subclasses to validate and prepare a newly built plan."""
+        pass
 
     def prepare_trainer_control_peer(self, table: TrainerTensorTable) -> None:
         peer_name = self.trainer_peer_names.get(0)

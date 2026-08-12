@@ -405,15 +405,18 @@ class RLConfig(BaseConfig):
                     "FP8-kernel transfer currently requires a pre-quantized FP8 inference checkpoint, "
                     "not inference.quantization online conversion."
                 )
-            if self.weight_broadcast.delta_mode == "xor" and (
-                "Qwen3" not in self.trainer.model.name
-                or "A3B" in self.trainer.model.name
-                or "A22B" in self.trainer.model.name
-            ):
+            if self.weight_broadcast.delta_mode == "xor" and "Qwen3" not in self.trainer.model.name:
                 raise ValueError(
-                    "resident FP8 XOR currently supports dense Qwen3 models; other architectures "
-                    "need an explicit TP-local vLLM resident converter."
+                    "resident FP8 XOR currently supports Qwen3 models; other architectures "
+                    "need an explicit rank-local vLLM resident converter."
                 )
+            model_name_parts = self.trainer.model.name.replace("/", "-").split("-")
+            qwen3_moe = any(
+                part.startswith("A") and part.endswith("B") and part[1:-1].isdigit()
+                for part in model_name_parts
+            )
+            if qwen3_moe and not self.inference.enable_expert_parallel:
+                raise ValueError("Qwen3-MoE FP8-kernel transfer requires inference.enable_expert_parallel=true.")
             if self.weight_broadcast.delta_mode == "xor" and self.inference.parallel.dp != 1:
                 raise ValueError("resident FP8 XOR currently requires inference.parallel.dp=1.")
             if self.weight_broadcast.delta_mode == "xor" and self.weight_broadcast.delta_fp8_scale_format != "float32":

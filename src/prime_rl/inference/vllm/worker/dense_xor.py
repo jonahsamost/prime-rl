@@ -35,6 +35,8 @@ def validate_dense_delta_model(model: nn.Module) -> torch.dtype:
         raise DeltaError(f"XOR delta loading does not support multimodal model_type={model_type!r}")
     if not callable(getattr(model, "load_weights", None)):
         raise DeltaError(f"XOR delta loading requires {type(model).__name__}.load_weights()")
+    # Intentionally conservative for now to require one storage dtype.
+    # load_weights() may cast between src/dst dtypes but floating point casts dont preserve xor deltas
     dtypes = {parameter.dtype for parameter in model.parameters()}
     if len(dtypes) != 1:
         raise DeltaError(f"XOR delta loading requires one model storage dtype, got {sorted(map(str, dtypes))}")
