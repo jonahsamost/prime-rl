@@ -158,6 +158,9 @@ class SharedNIXLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
     session_id: str = "default"
     """ModelExpress session ID."""
 
+    protocol: Literal["pull", "push"] = "pull"
+    """NIXL data movement direction. Push uses trainer-initiated writes."""
+
 
 class SharedFileSystemWeightBroadcastConfig(BaseConfig):
     type: Literal["filesystem"] = "filesystem"
@@ -482,7 +485,10 @@ class RLConfig(BaseConfig):
                 trainer_config_type = TrainerNCCLWeightBroadcastConfig
                 orchestrator_config_type = OrchestratorNCCLWeightBroadcastConfig
             else:
-                transport_config = dict(session_id=self.weight_broadcast.session_id)
+                transport_config = dict(
+                    session_id=self.weight_broadcast.session_id,
+                    protocol=self.weight_broadcast.protocol,
+                )
                 trainer_config_type = TrainerNIXLWeightBroadcastConfig
                 orchestrator_config_type = OrchestratorNIXLWeightBroadcastConfig
             self.trainer.weight_broadcast = trainer_config_type(**common_config, **transport_config)
@@ -491,7 +497,10 @@ class RLConfig(BaseConfig):
             self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig()
             self.orchestrator.weight_broadcast = OrchestratorFileSystemWeightBroadcastConfig()
         if self.inference is not None:
-            self.inference.weight_broadcast = InferenceWeightBroadcastConfig(type=self.weight_broadcast.type)
+            inference_config = dict(type=self.weight_broadcast.type)
+            if isinstance(self.weight_broadcast, SharedNIXLWeightBroadcastConfig):
+                inference_config["protocol"] = self.weight_broadcast.protocol
+            self.inference.weight_broadcast = InferenceWeightBroadcastConfig(**inference_config)
 
         validate_shared_weight_broadcast(self.trainer, self.orchestrator, self.inference)
 

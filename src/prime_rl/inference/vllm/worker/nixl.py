@@ -147,7 +147,7 @@ class NIXLWeightUpdateWorker(Worker):
         # Join the current generation directly. Publishing a transient READY
         # before the first pull would let the trainer mistake initialization
         # for a completed acknowledgement.
-        self.model_express.publish(nixl_metadata=self.nixl_agent.get_metadata())
+        self.model_express.publish(nixl_metadata=self.transfer_metadata(table, plan))
         self.model_express.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
         self.weight_transfer_plan = plan
         logger.info(
@@ -156,6 +156,14 @@ class NIXLWeightUpdateWorker(Worker):
             len(plan.groups),
         )
         return plan
+
+    def transfer_metadata(
+        self,
+        table: TrainerTensorTable,
+        plan: WeightTransferPlan,
+    ) -> bytes:
+        del table, plan
+        return self.nixl_agent.get_metadata()
 
     def trace_weight_loads(
         self,

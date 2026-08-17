@@ -5,19 +5,18 @@ from __future__ import annotations
 import os
 import socket
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Literal, Sequence
 
 from torch import Tensor
 
 MemDesc = tuple[int, int, int]
+TransferOperation = Literal["READ", "WRITE"]
 
 
 class NixlAgent:
     def __init__(self, name: str) -> None:
-        try:
-            from nixl_cu13._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
-        except ImportError:
-            from nixl._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
+        # The pinned nixl-cu12 wheel currently publishes this module namespace.
+        from nixl_cu13._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
 
         self.name = name
         self._agent = nixl_agent(name, nixl_agent_config(backends=["UCX"]))
@@ -29,7 +28,8 @@ class NixlAgent:
         return self._agent.get_agent_metadata()
 
     def add_remote_agent(self, metadata: bytes) -> str:
-        return self._agent.add_remote_agent(metadata)
+        peer_name = self._agent.add_remote_agent(metadata)
+        return peer_name.decode("utf-8") if isinstance(peer_name, bytes) else peer_name
 
     def make_connection(self, peer_name: str) -> None:
         self._agent.make_connection(peer_name)
@@ -43,8 +43,20 @@ class NixlAgent:
         )
 
     def post_read(self, local: Any, indices: Sequence[int], remote: Any) -> Any:
+        return self._post_transfer("READ", local, indices, remote)
+
+    def post_write(self, local: Any, indices: Sequence[int], remote: Any) -> Any:
+        return self._post_transfer("WRITE", local, indices, remote)
+
+    def _post_transfer(
+        self,
+        operation: TransferOperation,
+        local: Any,
+        indices: Sequence[int],
+        remote: Any,
+    ) -> Any:
         handle = self._agent.make_prepped_xfer(
-            operation="READ",
+            operation=operation,
             local_xfer_side=local,
             local_indices=list(indices),
             remote_xfer_side=remote,
@@ -53,7 +65,7 @@ class NixlAgent:
         )
         state = self._agent.transfer(handle)
         if state in ("ERR", "ERROR", "FAIL"):
-            raise RuntimeError(f"NIXL READ post failed with state {state}")
+            raise RuntimeError(f"NIXL {operation} post failed with state {state}")
         return handle
 
     def wait(

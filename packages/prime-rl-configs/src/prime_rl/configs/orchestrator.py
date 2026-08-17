@@ -379,6 +379,9 @@ class NIXLWeightBroadcastConfig(InMemoryWeightBroadcastConfig):
     session_id: str = "default"
     """ModelExpress session ID."""
 
+    protocol: Literal["pull", "push"] = "pull"
+    """NIXL data movement direction."""
+
 
 WeightBroadcastConfig: TypeAlias = Annotated[
     FileSystemWeightBroadcastConfig | NCCLWeightBroadcastConfig | NIXLWeightBroadcastConfig,

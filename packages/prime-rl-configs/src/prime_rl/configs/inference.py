@@ -217,6 +217,9 @@ class WeightBroadcastConfig(BaseConfig):
     type: Literal["nccl", "filesystem", "nixl"] = "filesystem"
     """Weight broadcast transport."""
 
+    protocol: Literal["pull", "push"] = "pull"
+    """NIXL data movement direction. Ignored by other transports."""
+
 
 class CPUOffloadTier(BaseConfig):
     num_bytes: int = Field(..., gt=0)

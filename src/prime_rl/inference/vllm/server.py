@@ -64,6 +64,7 @@ WORKER_EXTENSION_CLS = {
     "nccl": "prime_rl.inference.vllm.worker.nccl.NCCLWeightUpdateWorker",
     "filesystem": "prime_rl.inference.vllm.worker.filesystem.FileSystemWeightUpdateWorker",
     "nixl": "prime_rl.inference.vllm.worker.nixl.NIXLWeightUpdateWorker",
+    "nixl_push": "prime_rl.inference.vllm.worker.nixl_push.NIXLPushWeightUpdateWorker",
 }
 
 
@@ -230,7 +231,10 @@ def server(config: InferenceConfig):
     validate_parsed_serve_args(args)
 
     # Set the worker extension class based on the broadcast backend
-    args.worker_extension_cls = WORKER_EXTENSION_CLS[config.weight_broadcast.type]
+    worker_extension = config.weight_broadcast.type
+    if worker_extension == "nixl" and config.weight_broadcast.protocol == "push":
+        worker_extension = "nixl_push"
+    args.worker_extension_cls = WORKER_EXTENSION_CLS[worker_extension]
 
     if args.headless or args.api_server_count < 1:
         run_headless(args)
