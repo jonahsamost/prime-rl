@@ -80,6 +80,9 @@ class WeightTransferPlan:
 
 
 class NIXLWeightUpdateWorker(Worker):
+    # Whether a buffer can be reused before applying its weights.
+    ack_before_replay = True
+
     @property
     def raw_model(self) -> nn.Module:
         return cast(nn.Module, self.model_runner.get_model())
@@ -151,9 +154,10 @@ class NIXLWeightUpdateWorker(Worker):
         self.model_express.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
         self.weight_transfer_plan = plan
         logger.info(
-            "Initialized NIXL transfer plan on rank %d with %d groups",
+            "Initialized NIXL transfer plan on rank %d with %d groups and %d receive buffers",
             self.model_express.rank,
             len(plan.groups),
+            plan.receive_buffer_count,
         )
         return plan
 
@@ -583,10 +587,13 @@ class NIXLWeightUpdateWorker(Worker):
             )
             session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
 
+        acknowledge_before_replay = self.ack_before_replay
+
         def prefetch_group(group_index: int) -> WeightTransferGroup:
             torch.cuda.set_device(self.device)
             transfer_group = pull_group(group_index)
-            acknowledge_group(group_index)
+            if acknowledge_before_replay:
+                acknowledge_group(group_index)
             return transfer_group
 
         def replay_group(transfer_group: WeightTransferGroup) -> None:
@@ -634,7 +641,7 @@ class NIXLWeightUpdateWorker(Worker):
                     replay_group(transfer_group)
                     torch.cuda.synchronize(self.device)
 
-                    if not pipelined:
+                    if not pipelined or not acknowledge_before_replay:
                         acknowledge_group(group_index)
             finally:
                 cancelled.set()

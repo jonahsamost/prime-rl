@@ -161,6 +161,9 @@ class SharedNIXLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
     protocol: Literal["pull", "push"] = "pull"
     """NIXL data movement direction. Push uses trainer-initiated writes."""
 
+    push_buffer_count: Literal["auto"] | Annotated[int, Field(ge=1, le=8)] = "auto"
+    """Trainer and inference buffer-ring depth for push transfers. Ignored by pull transfers."""
+
 
 class SharedFileSystemWeightBroadcastConfig(BaseConfig):
     type: Literal["filesystem"] = "filesystem"
@@ -491,7 +494,10 @@ class RLConfig(BaseConfig):
                 )
                 trainer_config_type = TrainerNIXLWeightBroadcastConfig
                 orchestrator_config_type = OrchestratorNIXLWeightBroadcastConfig
-            self.trainer.weight_broadcast = trainer_config_type(**common_config, **transport_config)
+            trainer_transport_config = dict(transport_config)
+            if isinstance(self.weight_broadcast, SharedNIXLWeightBroadcastConfig):
+                trainer_transport_config["push_buffer_count"] = self.weight_broadcast.push_buffer_count
+            self.trainer.weight_broadcast = trainer_config_type(**common_config, **trainer_transport_config)
             self.orchestrator.weight_broadcast = orchestrator_config_type(**common_config, **transport_config)
         elif self.weight_broadcast.type == "filesystem":
             self.trainer.weight_broadcast = TrainerFileSystemWeightBroadcastConfig()

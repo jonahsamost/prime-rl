@@ -6,6 +6,7 @@ import torch
 
 from prime_rl.inference.vllm.worker.nixl import NIXLWeightUpdateWorker, WeightTransferPlan
 from prime_rl.trainer.rl.broadcast.nixl.agent import MemDesc
+from prime_rl.trainer.rl.broadcast.nixl.cuda_malloc_memory import size_cuda_buffers
 from prime_rl.trainer.rl.broadcast.nixl.receiver_table import (
     ReceiverAgent,
     ReceiverGroup,
@@ -17,6 +18,8 @@ from prime_rl.trainer.rl.broadcast.nixl.trainer_tensor_table import TrainerTenso
 
 class NIXLPushWeightUpdateWorker(NIXLWeightUpdateWorker):
     """Receive canonical tensors by NIXL WRITE and replay vLLM's load graph."""
+
+    ack_before_replay = False
 
     def init_broadcaster(
         self,
@@ -44,8 +47,24 @@ class NIXLPushWeightUpdateWorker(NIXLWeightUpdateWorker):
         receive_buffer_elements: dict[torch.dtype, int],
         staging_buffer_count: int,
     ) -> int:
-        del receive_buffer_elements, staging_buffer_count
-        return 1
+        buffer_bytes = sum(
+            elements * dtype.itemsize for dtype, elements in receive_buffer_elements.items()
+        )
+        if buffer_bytes == 0:
+            return staging_buffer_count
+
+        available = size_cuda_buffers(
+            buffer_bytes,
+            staging_buffer_count,
+            self.device,
+            extra_headroom_bytes=buffer_bytes,
+        )
+        if available < staging_buffer_count:
+            raise RuntimeError(
+                "NIXL push requires matching trainer and inference staging counts, but inference has "
+                f"memory for {available} of {staging_buffer_count} requested buffers"
+            )
+        return staging_buffer_count
 
     def prepare_group_pulls(
         self,

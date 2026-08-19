@@ -1,7 +1,16 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
+import pytest
+import torch
+
 from prime_rl.configs.rl import RLConfig
+from prime_rl.inference.vllm.worker import nixl_push as worker_push_module
+from prime_rl.inference.vllm.worker.nixl_push import NIXLPushWeightUpdateWorker
+from prime_rl.trainer.rl.broadcast.nixl import push as push_module
 from prime_rl.trainer.rl.broadcast.nixl.agent import NixlAgent
+from prime_rl.trainer.rl.broadcast.nixl.push import NIXLPushWeightBroadcast
 from prime_rl.trainer.rl.broadcast.nixl.receiver_table import (
     ReceiverAgent,
     ReceiverGroup,
@@ -74,7 +83,11 @@ def test_receiver_table_round_trip() -> None:
 def test_push_protocol_propagates_to_all_rl_components() -> None:
     config = RLConfig.model_validate(
         {
-            "weight_broadcast": {"type": "nixl", "protocol": "push"},
+            "weight_broadcast": {
+                "type": "nixl",
+                "protocol": "push",
+                "push_buffer_count": 4,
+            },
             "trainer": {},
             "orchestrator": {"renderer": {"name": "default"}},
             "inference": {},
@@ -82,6 +95,142 @@ def test_push_protocol_propagates_to_all_rl_components() -> None:
     )
 
     assert config.trainer.weight_broadcast.protocol == "push"
+    assert config.trainer.weight_broadcast.push_buffer_count == 4
     assert config.orchestrator.weight_broadcast.protocol == "push"
     assert config.inference is not None
     assert config.inference.weight_broadcast.protocol == "push"
+
+
+def test_push_pipeline_waits_for_previous_replay_before_publishing_next_group(monkeypatch) -> None:
+    broadcast = object.__new__(NIXLPushWeightBroadcast)
+    broadcast.transfer_group_names = ["group.0", "group.1", "group.2"]
+    broadcast.staging_buffer_count = 2
+    broadcast.world = SimpleNamespace(is_master=False)
+    broadcast.logger = SimpleNamespace(info=lambda message: None)
+
+    events: list[str] = []
+    broadcast.initialize_transfer = lambda model: None
+    broadcast.reset_staging_buffer = lambda slot: events.append(f"reuse:{slot}")
+    broadcast.stage_group = lambda group: events.append(f"stage:{group}")
+    broadcast.post_group_writes = lambda group: events.append(f"post:{group}") or []
+    broadcast.finish_group_writes = lambda group, pending: events.append(f"finish:{group}")
+    broadcast.publish_group = lambda group: events.append(f"ready:{group}")
+    monkeypatch.setattr(push_module.dist, "barrier", lambda: None)
+
+    broadcast.broadcast_weights(SimpleNamespace(), step=7)
+
+    assert events[:5] == [
+        "stage:0",
+        "post:0",
+        "finish:0",
+        "ready:0",
+        "stage:1",
+    ]
+    assert events == [
+        "stage:0",
+        "post:0",
+        "finish:0",
+        "ready:0",
+        "stage:1",
+        "post:1",
+        "finish:1",
+        "reuse:0",
+        "ready:1",
+        "stage:2",
+        "post:2",
+        "finish:2",
+        "reuse:1",
+        "ready:2",
+        "reuse:0",
+    ]
+
+
+def test_push_pipeline_finishes_write_before_reusing_single_slot(monkeypatch) -> None:
+    broadcast = object.__new__(NIXLPushWeightBroadcast)
+    broadcast.transfer_group_names = ["group.0", "group.1"]
+    broadcast.staging_buffer_count = 1
+    broadcast.world = SimpleNamespace(is_master=False)
+    broadcast.logger = SimpleNamespace(info=lambda message: None)
+
+    events: list[str] = []
+    broadcast.initialize_transfer = lambda model: None
+    broadcast.finish_staging_buffer_transfer = lambda slot: events.append(f"reuse:{slot}")
+    broadcast.stage_group = lambda group: events.append(f"stage:{group}")
+    broadcast.post_group_writes = lambda group: events.append(f"post:{group}") or []
+    broadcast.finish_group_writes = lambda group, pending: events.append(f"finish:{group}")
+    broadcast.publish_group = lambda group: events.append(f"ready:{group}")
+    monkeypatch.setattr(push_module.dist, "barrier", lambda: None)
+
+    broadcast.broadcast_weights(SimpleNamespace(), step=7)
+
+    assert events == [
+        "stage:0",
+        "post:0",
+        "finish:0",
+        "ready:0",
+        "reuse:0",
+        "stage:1",
+        "post:1",
+        "finish:1",
+        "ready:1",
+        "reuse:0",
+    ]
+
+
+def test_push_pipeline_wraps_configured_buffer_ring(monkeypatch) -> None:
+    broadcast = object.__new__(NIXLPushWeightBroadcast)
+    broadcast.transfer_group_names = [f"group.{index}" for index in range(7)]
+    broadcast.staging_buffer_count = 4
+    broadcast.world = SimpleNamespace(is_master=False)
+    broadcast.logger = SimpleNamespace(info=lambda message: None)
+
+    events: list[str] = []
+    broadcast.initialize_transfer = lambda model: None
+    broadcast.reset_staging_buffer = lambda slot: events.append(f"reuse:{slot}")
+    broadcast.stage_group = lambda group: events.append(f"stage:{group}")
+    broadcast.post_group_writes = lambda group: []
+    broadcast.finish_group_writes = lambda group, pending: None
+    broadcast.publish_group = lambda group: events.append(f"ready:{group}")
+    monkeypatch.setattr(push_module.dist, "barrier", lambda: None)
+
+    broadcast.broadcast_weights(SimpleNamespace(), step=7)
+
+    assert events == [
+        "stage:0",
+        "ready:0",
+        "stage:1",
+        "ready:1",
+        "stage:2",
+        "ready:2",
+        "stage:3",
+        "reuse:0",
+        "ready:3",
+        "stage:4",
+        "reuse:1",
+        "ready:4",
+        "stage:5",
+        "reuse:2",
+        "ready:5",
+        "stage:6",
+        "reuse:3",
+        "ready:6",
+        "reuse:0",
+        "reuse:1",
+        "reuse:2",
+    ]
+
+
+def test_push_receiver_requires_matching_buffer_ring(monkeypatch) -> None:
+    worker = object.__new__(NIXLPushWeightUpdateWorker)
+    worker.device = torch.device("cuda", 0)
+    elements = {torch.bfloat16: 1024}
+
+    assert worker.choose_receive_buffer_count({}, staging_buffer_count=4) == 4
+
+    monkeypatch.setattr(worker_push_module, "size_cuda_buffers", lambda *args, **kwargs: 1)
+    with pytest.raises(RuntimeError, match="matching trainer and inference staging counts"):
+        worker.choose_receive_buffer_count(elements, staging_buffer_count=2)
+
+    monkeypatch.setattr(worker_push_module, "size_cuda_buffers", lambda *args, **kwargs: 4)
+    assert worker.choose_receive_buffer_count(elements, staging_buffer_count=4) == 4
+    assert not worker.ack_before_replay

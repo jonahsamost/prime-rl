@@ -336,6 +336,10 @@ class NIXLWeightBroadcast(WeightBroadcast):
             ],
         )
 
+    def _initialize_protocol(self) -> None:
+        """Perform protocol-specific setup after publishing trainer metadata."""
+        pass
+
     def initialize_transfer(self, model: nn.Module) -> None:
         if self.initialized:
             return
@@ -382,9 +386,10 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 f"Published {tensor_count} trainer tensors in {len(table.groups)} groups "
                 f"from {len(table.agents)} agents with {self.staging_buffer_count} staging buffers"
             )
+        self._initialize_protocol()
         self.initialized = True
 
-    def finish_staging_buffer_transfer(self, buffer_index: int) -> None:
+    def reset_staging_buffer(self, buffer_index: int) -> None:
         if self.world.is_master:
             session = self.buffer_sessions[buffer_index]
             session.wait_for(
@@ -402,27 +407,50 @@ class NIXLWeightBroadcast(WeightBroadcast):
                 timeout=self.config.timeout,
                 poll_interval=BUFFER_POLL_INTERVAL,
             )
+
+    def finish_staging_buffer_transfer(self, buffer_index: int) -> None:
+        self.reset_staging_buffer(buffer_index)
+        dist.barrier()
+
+    def _begin_update(self) -> None:
+        if not self.world.is_master:
+            return
+        self.model_express.set_status(p2p_pb2.SOURCE_STATUS_READY)
+        self.model_express.wait_for(
+            "orchestrator",
+            count=1,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+            timeout=self.config.timeout,
+        )
+        self.model_express.wait_for(
+            "inference",
+            count=self.config.inference_world_size,
+            status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+            timeout=self.config.timeout,
+        )
+
+    def _finish_update(self) -> None:
+        if self.world.is_master:
+            self.model_express.wait_for(
+                "inference",
+                count=self.config.inference_world_size,
+                status=p2p_pb2.SOURCE_STATUS_READY,
+                timeout=self.config.timeout,
+            )
+            self.model_express.wait_for(
+                "orchestrator",
+                count=1,
+                status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+                timeout=self.config.timeout,
+            )
+            self.model_express.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
         dist.barrier()
 
     @torch.no_grad()
     def broadcast_weights(self, model: nn.Module, step: int) -> None:
         self.initialize_transfer(model)
         start = time.perf_counter()
-
-        if self.world.is_master:
-            self.model_express.set_status(p2p_pb2.SOURCE_STATUS_READY)
-            self.model_express.wait_for(
-                "orchestrator",
-                count=1,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-                timeout=self.config.timeout,
-            )
-            self.model_express.wait_for(
-                "inference",
-                count=self.config.inference_world_size,
-                status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
-                timeout=self.config.timeout,
-            )
+        self._begin_update()
 
         for group, group_name in enumerate(self.transfer_group_names):
             group_start = time.perf_counter()
@@ -447,19 +475,5 @@ class NIXLWeightBroadcast(WeightBroadcast):
             buffer_index = group % self.staging_buffer_count
             self.finish_staging_buffer_transfer(buffer_index)
 
-        if self.world.is_master:
-            self.model_express.wait_for(
-                "inference",
-                count=self.config.inference_world_size,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-                timeout=self.config.timeout,
-            )
-            self.model_express.wait_for(
-                "orchestrator",
-                count=1,
-                status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
-                timeout=self.config.timeout,
-            )
-            self.model_express.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
-        dist.barrier()
+        self._finish_update()
         self.logger.info(f"NIXL+ModelExpress policy v{step} synchronized in {time.perf_counter() - start:.2f}s")
