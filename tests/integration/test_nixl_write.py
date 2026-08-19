@@ -14,7 +14,7 @@ pytestmark = pytest.mark.gpu
 ReceiverInfo: TypeAlias = tuple[bytes, int, int, int]
 
 
-def run_receiver(ready: Any, control: Any, result: Any, suffix: str) -> None:
+def run_receiver(ready: Any, result: Any, suffix: str) -> None:
     torch.cuda.set_device(0)
     set_ucx_env_defaults()
     receiver = NixlAgent(f"write-test-receiver-{suffix}")
@@ -29,7 +29,10 @@ def run_receiver(ready: Any, control: Any, result: Any, suffix: str) -> None:
         )
     )
 
-    control.get(timeout=30)
+    receiver.wait_for_notifications(
+        {f"write-test-sender-{suffix}": b"written"},
+        timeout=30,
+    )
     torch.cuda.synchronize()
     expected = torch.arange(4096, dtype=torch.int32, device="cuda")
     result.put(torch.equal(destination, expected))
@@ -50,25 +53,23 @@ def run_sender(receiver_info: ReceiverInfo, suffix: str) -> None:
         [(destination_addr, destination_nbytes, destination_device)],
         agent_name=receiver_peer,
     )
-    handle = sender.post_write(local, [0], remote)
+    handle = sender.post_write(local, [0], remote, b"written")
     sender.wait(handle, context="NIXL WRITE integration test", timeout=10)
 
 
 def test_nixl_write_updates_registered_cuda_memory() -> None:
     context = mp.get_context("spawn")
     ready = context.Queue()
-    control = context.Queue()
     result = context.Queue()
     suffix = uuid4().hex
 
-    receiver = context.Process(target=run_receiver, args=(ready, control, result, suffix))
+    receiver = context.Process(target=run_receiver, args=(ready, result, suffix))
     receiver.start()
     receiver_info = ready.get(timeout=30)
 
     sender = context.Process(target=run_sender, args=(receiver_info, suffix))
     sender.start()
     sender.join(timeout=30)
-    control.put("verify")
     transferred = result.get(timeout=30)
     receiver.join(timeout=30)
 

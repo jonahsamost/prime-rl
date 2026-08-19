@@ -519,26 +519,81 @@ class NIXLWeightUpdateWorker(Worker):
     def update_weights_from_path(self, weight_dir: str | None = None) -> None:
         del weight_dir
         plan = self.initialize_transfer()
+        protocol_started = time.perf_counter()
         self.model_express.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+
+        phase_started = time.perf_counter()
         self.model_express.wait_for(
             "trainer",
             count=1,
             status=p2p_pb2.SOURCE_STATUS_READY,
             timeout=self.weight_transfer_timeout,
         )
+        trainer_ready = time.perf_counter() - phase_started
 
         started = time.perf_counter()
-        self.apply_transfer_plan(plan)
+        phases = self.apply_transfer_plan(plan)
+
+        phase_started = time.perf_counter()
         update_mla_absorbed_weights(self.raw_model)
+        mla_postprocess = time.perf_counter() - phase_started
+
+        phase_started = time.perf_counter()
         torch.cuda.synchronize(self.device)
+        final_cuda_sync = time.perf_counter() - phase_started
+
+        phase_started = time.perf_counter()
         self.model_express.set_status(p2p_pb2.SOURCE_STATUS_READY)
+        publish_ready = time.perf_counter() - phase_started
+        apply_total = time.perf_counter() - started
+        protocol_total = time.perf_counter() - protocol_started
+        phase_values = {
+            "trainer_ready": trainer_ready,
+            **phases,
+            "mla_postprocess": mla_postprocess,
+            "final_cuda_sync": final_cuda_sync,
+            "publish_ready": publish_ready,
+        }
+        phase_summary = " ".join(f"{name}={value:.4f}s" for name, value in phase_values.items())
+        logger.info(
+            "NIXL policy update phases on rank %d: protocol_total=%.4fs apply_total=%.4fs groups=%d buffers=%d %s",
+            self.model_express.rank,
+            protocol_total,
+            apply_total,
+            len(plan.groups),
+            plan.receive_buffer_count,
+            phase_summary,
+        )
         logger.info(
             "Applied NIXL policy update on rank %d in %.2fs",
             self.model_express.rank,
-            time.perf_counter() - started,
+            apply_total,
         )
 
-    def apply_transfer_plan(self, plan: WeightTransferPlan) -> None:
+    def _wait_for_group_ready(self, group_index: int, cancelled: Event) -> None:
+        self.buffer_sessions[group_index % len(self.buffer_sessions)].wait_for(
+            "trainer",
+            count=1,
+            status=p2p_pb2.SOURCE_STATUS_READY,
+            timeout=self.weight_transfer_timeout,
+            poll_interval=_BUFFER_POLL_INTERVAL,
+            cancelled=cancelled.is_set,
+        )
+
+    def _acknowledge_group(self, group_index: int, cancelled: Event) -> None:
+        session = self.buffer_sessions[group_index % len(self.buffer_sessions)]
+        session.set_status(p2p_pb2.SOURCE_STATUS_READY)
+        session.wait_for(
+            "trainer",
+            count=1,
+            status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
+            timeout=self.weight_transfer_timeout,
+            poll_interval=_BUFFER_POLL_INTERVAL,
+            cancelled=cancelled.is_set,
+        )
+        session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+
+    def apply_transfer_plan(self, plan: WeightTransferPlan) -> dict[str, float]:
         from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
         from vllm.model_executor.model_loader.reload.layerwise import (
             LAYERWISE_INFO,
@@ -551,19 +606,16 @@ class NIXLWeightUpdateWorker(Worker):
 
         model = self.raw_model
         cancelled = Event()
+        phases: defaultdict[str, float] = defaultdict(float)
 
         def pull_group(group_index: int) -> WeightTransferGroup:
             transfer_group = plan.groups[group_index]
-            session = self.buffer_sessions[group_index % len(self.buffer_sessions)]
-            session.wait_for(
-                "trainer",
-                count=1,
-                status=p2p_pb2.SOURCE_STATUS_READY,
-                timeout=self.weight_transfer_timeout,
-                poll_interval=_BUFFER_POLL_INTERVAL,
-                cancelled=cancelled.is_set,
-            )
 
+            phase_started = time.perf_counter()
+            self._wait_for_group_ready(group_index, cancelled)
+            phases["source_ready"] += time.perf_counter() - phase_started
+
+            phase_started = time.perf_counter()
             for local, remote, indices in transfer_group.pulls:
                 handle = self.nixl_agent.post_read(local, indices, remote)
                 self.nixl_agent.wait(
@@ -572,20 +624,13 @@ class NIXLWeightUpdateWorker(Worker):
                     timeout=self.weight_transfer_timeout,
                     cancelled=cancelled.is_set,
                 )
+            phases["nixl_read"] += time.perf_counter() - phase_started
             return transfer_group
 
         def acknowledge_group(group_index: int) -> None:
-            session = self.buffer_sessions[group_index % len(self.buffer_sessions)]
-            session.set_status(p2p_pb2.SOURCE_STATUS_READY)
-            session.wait_for(
-                "trainer",
-                count=1,
-                status=p2p_pb2.SOURCE_STATUS_INITIALIZING,
-                timeout=self.weight_transfer_timeout,
-                poll_interval=_BUFFER_POLL_INTERVAL,
-                cancelled=cancelled.is_set,
-            )
-            session.set_status(p2p_pb2.SOURCE_STATUS_INITIALIZING)
+            phase_started = time.perf_counter()
+            self._acknowledge_group(group_index, cancelled)
+            phases["acknowledge"] += time.perf_counter() - phase_started
 
         acknowledge_before_replay = self.ack_before_replay
 
@@ -626,20 +671,31 @@ class NIXLWeightUpdateWorker(Worker):
                 info.reset()
 
         with torch.device(self.device), set_current_vllm_config(self.vllm_config):
+            phase_started = time.perf_counter()
             initialize_layerwise_reload(model)
+            phases["reload_initialize"] += time.perf_counter() - phase_started
             pipelined = plan.receive_buffer_count > 1
             executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nixl-prefetch") if pipelined else None
             try:
                 pull = executor.submit(prefetch_group, 0) if executor is not None else None
                 for group_index in range(len(plan.groups)):
+                    phase_started = time.perf_counter()
                     transfer_group = pull.result() if pull is not None else pull_group(group_index)
+                    phases["group_ready_blocked"] += time.perf_counter() - phase_started
 
+                    phase_started = time.perf_counter()
                     torch.cuda.synchronize(self.device)
+                    phases["pre_replay_cuda_sync"] += time.perf_counter() - phase_started
                     if executor is not None and group_index + 1 < len(plan.groups):
                         pull = executor.submit(prefetch_group, group_index + 1)
 
+                    phase_started = time.perf_counter()
                     replay_group(transfer_group)
+                    phases["replay_enqueue"] += time.perf_counter() - phase_started
+
+                    phase_started = time.perf_counter()
                     torch.cuda.synchronize(self.device)
+                    phases["replay_cuda_sync"] += time.perf_counter() - phase_started
 
                     if not pipelined or not acknowledge_before_replay:
                         acknowledge_group(group_index)
@@ -648,7 +704,10 @@ class NIXLWeightUpdateWorker(Worker):
                 if executor is not None:
                     executor.shutdown(wait=True, cancel_futures=True)
 
+            phase_started = time.perf_counter()
             finalize_layerwise_reload(model, self.model_runner.model_config)
+            phases["reload_finalize"] += time.perf_counter() - phase_started
+        return dict(phases)
 
     @staticmethod
     def replay_tensor_copy(plan: TensorCopyPlan) -> None:

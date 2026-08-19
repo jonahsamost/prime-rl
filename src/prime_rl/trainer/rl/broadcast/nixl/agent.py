@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import os
 import socket
+import struct
 import time
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from torch import Tensor
 
 MemDesc = tuple[int, int, int]
 TransferOperation = Literal["READ", "WRITE"]
+
+
+def group_notification(group_index: int, generation: int) -> bytes:
+    return struct.pack(">QQ", group_index, generation)
 
 
 class NixlAgent:
@@ -42,11 +47,23 @@ class NixlAgent:
             backends=["UCX"],
         )
 
-    def post_read(self, local: Any, indices: Sequence[int], remote: Any) -> Any:
-        return self._post_transfer("READ", local, indices, remote)
+    def post_read(
+        self,
+        local: Any,
+        indices: Sequence[int],
+        remote: Any,
+        notification: bytes = b"",
+    ) -> Any:
+        return self._post_transfer("READ", local, indices, remote, notification)
 
-    def post_write(self, local: Any, indices: Sequence[int], remote: Any) -> Any:
-        return self._post_transfer("WRITE", local, indices, remote)
+    def post_write(
+        self,
+        local: Any,
+        indices: Sequence[int],
+        remote: Any,
+        notification: bytes = b"",
+    ) -> Any:
+        return self._post_transfer("WRITE", local, indices, remote, notification)
 
     def _post_transfer(
         self,
@@ -54,6 +71,7 @@ class NixlAgent:
         local: Any,
         indices: Sequence[int],
         remote: Any,
+        notification: bytes,
     ) -> Any:
         handle = self._agent.make_prepped_xfer(
             operation=operation,
@@ -63,10 +81,43 @@ class NixlAgent:
             remote_indices=list(indices),
             backends=["UCX"],
         )
-        state = self._agent.transfer(handle)
+        state = (
+            self._agent.transfer(handle, notif_msg=notification)
+            if notification
+            else self._agent.transfer(handle)
+        )
         if state in ("ERR", "ERROR", "FAIL"):
             raise RuntimeError(f"NIXL {operation} post failed with state {state}")
         return handle
+
+    def send_notification(self, peer_name: str, notification: bytes) -> None:
+        self._agent.send_notif(peer_name, notification)
+
+    def wait_for_notifications(
+        self,
+        expected: Mapping[str, bytes],
+        *,
+        timeout: float,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> None:
+        pending = dict(expected)
+        deadline = time.monotonic() + timeout
+        while pending:
+            if cancelled is not None and cancelled():
+                raise RuntimeError("NIXL notification wait cancelled")
+            for sender, message in list(pending.items()):
+                if self._agent.check_remote_xfer_done(
+                    sender,
+                    message,
+                    backends=["UCX"],
+                    tag_is_prefix=False,
+                ):
+                    del pending[sender]
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"NIXL notification wait timed out after {timeout}s, missing={list(pending)}"
+                )
+            time.sleep(0.0005)
 
     def wait(
         self,

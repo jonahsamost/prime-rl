@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +12,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from modelexpress import p2p_pb2
 
+from prime_rl.trainer.rl.broadcast.nixl.agent import group_notification
 from prime_rl.trainer.rl.broadcast.nixl.cuda_malloc_memory import size_cuda_buffers
 from prime_rl.trainer.rl.broadcast.nixl.nixl import NIXLWeightBroadcast
 from prime_rl.trainer.rl.broadcast.nixl.receiver_table import ReceiverTable
@@ -19,6 +21,7 @@ from prime_rl.trainer.rl.broadcast.nixl.receiver_table import ReceiverTable
 @dataclass(frozen=True)
 class PreparedWrite:
     receiver_rank: int
+    peer_name: str
     local: Any
     remote: Any
     indices: list[int]
@@ -92,6 +95,7 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
             if self.is_serving_rank
             else [[] for _ in self.transfer_group_names]
         )
+        self._group_generations = [0] * len(self.transfer_group_names)
         if self.is_serving_rank:
             self.staging_stream = torch.cuda.Stream(device=torch.cuda.current_device())
 
@@ -120,6 +124,7 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
                 groups[group_index].append(
                     PreparedWrite(
                         receiver_rank=receiver.agent.rank,
+                        peer_name=peer_name,
                         local=local,
                         remote=remote,
                         indices=list(range(len(routes))),
@@ -144,10 +149,16 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
         staged.synchronize()
 
     def post_group_writes(self, group_index: int) -> list[PendingWrite]:
+        notification = group_notification(group_index, self._group_generations[group_index])
         return [
             PendingWrite(
                 receiver_rank=write.receiver_rank,
-                handle=self.nixl_agent.post_write(write.local, write.indices, write.remote),
+                handle=self.nixl_agent.post_write(
+                    write.local,
+                    write.indices,
+                    write.remote,
+                    notification,
+                ),
             )
             for write in self.prepared_writes[group_index]
         ]
@@ -163,24 +174,38 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
                 timeout=self.config.timeout,
             )
 
-    def publish_group(self, group_index: int) -> None:
-        if self.world.is_master:
-            self.buffer_sessions[group_index % self.staging_buffer_count].set_status(
-                p2p_pb2.SOURCE_STATUS_READY
-            )
+    def finish_staging_buffer_transfer(self, group_index: int) -> None:
+        expected = {
+            write.peer_name: group_notification(group_index, self._group_generations[group_index])
+            for write in self.prepared_writes[group_index]
+        }
+        if expected:
+            self.nixl_agent.wait_for_notifications(expected, timeout=self.config.timeout)
+        self._group_generations[group_index] += 1
 
-    def _transfer_group(self, group_index: int, step: int, reset_buffer: int | None = None) -> None:
+    def _transfer_group(self, group_index: int, step: int, reused_group: int | None = None) -> None:
         started = time.perf_counter()
-        self.stage_group(group_index)
-        pending = self.post_group_writes(group_index)
-        self.finish_group_writes(group_index, pending)
-        if reset_buffer is not None:
-            self.reset_staging_buffer(reset_buffer)
 
-        # The group may be published only after every contributing trainer
-        # rank has completed its writes and any next-use slot is reusable.
+        phase_started = time.perf_counter()
+        self.stage_group(group_index)
+        self._phase_times["stage"] += time.perf_counter() - phase_started
+
+        phase_started = time.perf_counter()
+        pending = self.post_group_writes(group_index)
+        self._phase_times["post_writes"] += time.perf_counter() - phase_started
+
+        phase_started = time.perf_counter()
+        self.finish_group_writes(group_index, pending)
+        self._phase_times["write_completion"] += time.perf_counter() - phase_started
+
+        if reused_group is not None:
+            phase_started = time.perf_counter()
+            self.finish_staging_buffer_transfer(reused_group)
+            self._phase_times["buffer_reuse"] += time.perf_counter() - phase_started
+
+        phase_started = time.perf_counter()
         dist.barrier()
-        self.publish_group(group_index)
+        self._phase_times["group_barrier"] += time.perf_counter() - phase_started
         if self.world.is_master:
             self.logger.debug(
                 f"NIXL push policy v{step} group {self.transfer_group_names[group_index]} transferred in "
@@ -190,38 +215,56 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
     def _broadcast_single_buffer(self, step: int) -> None:
         for group_index in range(len(self.transfer_group_names)):
             if group_index:
-                self.finish_staging_buffer_transfer(0)
+                phase_started = time.perf_counter()
+                self.finish_staging_buffer_transfer(group_index - 1)
+                self._phase_times["buffer_reuse"] += time.perf_counter() - phase_started
             self._transfer_group(group_index, step)
         if self.transfer_group_names:
-            self.finish_staging_buffer_transfer(0)
+            phase_started = time.perf_counter()
+            self.finish_staging_buffer_transfer(len(self.transfer_group_names) - 1)
+            self._phase_times["buffer_reuse"] += time.perf_counter() - phase_started
 
     def _broadcast_buffer_ring(self, step: int) -> None:
         for group_index in range(len(self.transfer_group_names)):
             next_group = group_index + 1
-            reset_buffer = (
-                next_group % self.staging_buffer_count
+            reused_group = (
+                next_group - self.staging_buffer_count
                 if next_group >= self.staging_buffer_count
                 else None
             )
-            self._transfer_group(group_index, step, reset_buffer)
+            self._transfer_group(group_index, step, reused_group)
 
         first_pending_group = max(
             0,
             len(self.transfer_group_names) - self.staging_buffer_count + 1,
         )
         for group_index in range(first_pending_group, len(self.transfer_group_names)):
-            self.reset_staging_buffer(group_index % self.staging_buffer_count)
+            phase_started = time.perf_counter()
+            self.finish_staging_buffer_transfer(group_index)
+            self._phase_times["buffer_reuse"] += time.perf_counter() - phase_started
 
     @torch.no_grad()
     def broadcast_weights(self, model: nn.Module, step: int) -> None:
         self.initialize_transfer(model)
         start = time.perf_counter()
+
+        self._phase_times: defaultdict[str, float] = defaultdict(float)
+        phase_started = time.perf_counter()
         self._begin_update()
+        self._phase_times["begin_update"] = time.perf_counter() - phase_started
 
         if self.staging_buffer_count == 1:
             self._broadcast_single_buffer(step)
         else:
             self._broadcast_buffer_ring(step)
 
+        phase_started = time.perf_counter()
         self._finish_update()
-        self.logger.info(f"NIXL push policy v{step} synchronized in {time.perf_counter() - start:.2f}s")
+        self._phase_times["finish_update"] = time.perf_counter() - phase_started
+        total = time.perf_counter() - start
+        phases = " ".join(f"{name}={value:.4f}s" for name, value in self._phase_times.items())
+        self.logger.info(
+            f"NIXL push policy v{step} phases: total={total:.4f}s groups={len(self.transfer_group_names)} "
+            f"buffers={self.staging_buffer_count} {phases}"
+        )
+        self.logger.info(f"NIXL push policy v{step} synchronized in {total:.2f}s")

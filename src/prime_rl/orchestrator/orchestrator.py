@@ -418,6 +418,11 @@ class Orchestrator:
             observers=[self.dispatcher, self],
             lora_name=self.lora_name,
             ckpt_step=self.policy.version,
+            poll_interval=(
+                0.05
+                if config.weight_broadcast.type == "nixl" and config.weight_broadcast.protocol == "push"
+                else 1.0
+            ),
             model_express=self.model_express,
         )
         # Single periodic logger for the whole pipeline. It's the only
