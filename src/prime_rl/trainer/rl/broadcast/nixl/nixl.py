@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import time
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -449,11 +448,9 @@ class NIXLWeightBroadcast(WeightBroadcast):
     @torch.no_grad()
     def broadcast_weights(self, model: nn.Module, step: int) -> None:
         self.initialize_transfer(model)
-        start = time.perf_counter()
         self._begin_update()
 
-        for group, group_name in enumerate(self.transfer_group_names):
-            group_start = time.perf_counter()
+        for group in range(len(self.transfer_group_names)):
             buffer_index = group % self.staging_buffer_count
             if group >= self.staging_buffer_count:
                 self.finish_staging_buffer_transfer(buffer_index)
@@ -465,10 +462,6 @@ class NIXLWeightBroadcast(WeightBroadcast):
             dist.barrier()
             if self.world.is_master:
                 self.buffer_sessions[buffer_index].set_status(p2p_pb2.SOURCE_STATUS_READY)
-                self.logger.debug(
-                    f"NIXL+ModelExpress policy v{step} group {group_name} staged in buffer {buffer_index} in "
-                    f"{time.perf_counter() - group_start:.2f}s"
-                )
 
         first_pending_group = max(0, len(self.transfer_group_names) - self.staging_buffer_count)
         for group in range(first_pending_group, len(self.transfer_group_names)):
@@ -476,4 +469,3 @@ class NIXLWeightBroadcast(WeightBroadcast):
             self.finish_staging_buffer_transfer(buffer_index)
 
         self._finish_update()
-        self.logger.info(f"NIXL+ModelExpress policy v{step} synchronized in {time.perf_counter() - start:.2f}s")

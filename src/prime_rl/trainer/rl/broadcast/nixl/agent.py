@@ -20,8 +20,10 @@ def group_notification(group_index: int, generation: int) -> bytes:
 
 class NixlAgent:
     def __init__(self, name: str) -> None:
-        # The pinned nixl-cu12 wheel currently publishes this module namespace.
-        from nixl_cu13._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
+        try:
+            from nixl_cu13._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
+        except ImportError:
+            from nixl._api import nixl_agent, nixl_agent_config  # type: ignore[import-not-found]
 
         self.name = name
         self._agent = nixl_agent(name, nixl_agent_config(backends=["UCX"]))
@@ -48,20 +50,12 @@ class NixlAgent:
         )
 
     def post_read(
-        self,
-        local: Any,
-        indices: Sequence[int],
-        remote: Any,
-        notification: bytes = b"",
+        self, local: Any, indices: Sequence[int], remote: Any, notification: bytes = b"",
     ) -> Any:
         return self._post_transfer("READ", local, indices, remote, notification)
 
     def post_write(
-        self,
-        local: Any,
-        indices: Sequence[int],
-        remote: Any,
-        notification: bytes = b"",
+        self, local: Any, indices: Sequence[int], remote: Any, notification: bytes = b"",
     ) -> Any:
         return self._post_transfer("WRITE", local, indices, remote, notification)
 
@@ -91,6 +85,7 @@ class NixlAgent:
         return handle
 
     def send_notification(self, peer_name: str, notification: bytes) -> None:
+        """Send a peer-to-peer NIXL notification without using the ModelExpress control plane."""
         self._agent.send_notif(peer_name, notification)
 
     def wait_for_notifications(
@@ -100,6 +95,7 @@ class NixlAgent:
         timeout: float,
         cancelled: Callable[[], bool] | None = None,
     ) -> None:
+        """Wait for expected peer-to-peer NIXL notifications without polling ModelExpress."""
         pending = dict(expected)
         deadline = time.monotonic() + timeout
         while pending:
@@ -107,10 +103,7 @@ class NixlAgent:
                 raise RuntimeError("NIXL notification wait cancelled")
             for sender, message in list(pending.items()):
                 if self._agent.check_remote_xfer_done(
-                    sender,
-                    message,
-                    backends=["UCX"],
-                    tag_is_prefix=False,
+                    sender, message, backends=["UCX"], tag_is_prefix=False,
                 ):
                     del pending[sender]
             if time.monotonic() >= deadline:

@@ -77,6 +77,7 @@ class NIXLPushWeightUpdateWorker(NIXLWeightUpdateWorker):
         remote_descs: dict[int, list[MemDesc]],
         peer_names: dict[int, str],
     ) -> list[tuple[object, object, list[int]]]:
+        """Record trainer-to-inference routes for subsequent NIXL writes."""
         routes: list[ReceiverRoute] = []
         trainer_peers: list[str] = []
         for agent_index, sources in sorted(remote_descs.items()):

@@ -162,7 +162,7 @@ class SharedNIXLWeightBroadcastConfig(SharedInMemoryWeightBroadcastConfig):
     """NIXL data movement direction. Push uses trainer-initiated writes."""
 
     push_buffer_count: Literal["auto"] | Annotated[int, Field(ge=1, le=8)] = "auto"
-    """Trainer and inference buffer-ring depth for push transfers. Ignored by pull transfers."""
+    """Trainer and inference ring buffer depth for _push_ transfers."""
 
 
 class SharedFileSystemWeightBroadcastConfig(BaseConfig):

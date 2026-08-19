@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
 
@@ -183,48 +181,25 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
             self.nixl_agent.wait_for_notifications(expected, timeout=self.config.timeout)
         self._group_generations[group_index] += 1
 
-    def _transfer_group(self, group_index: int, step: int, reused_group: int | None = None) -> None:
-        started = time.perf_counter()
-
-        phase_started = time.perf_counter()
+    def _transfer_group(self, group_index: int, reused_group: int | None = None) -> None:
         self.stage_group(group_index)
-        self._phase_times["stage"] += time.perf_counter() - phase_started
-
-        phase_started = time.perf_counter()
         pending = self.post_group_writes(group_index)
-        self._phase_times["post_writes"] += time.perf_counter() - phase_started
-
-        phase_started = time.perf_counter()
         self.finish_group_writes(group_index, pending)
-        self._phase_times["write_completion"] += time.perf_counter() - phase_started
 
         if reused_group is not None:
-            phase_started = time.perf_counter()
             self.finish_staging_buffer_transfer(reused_group)
-            self._phase_times["buffer_reuse"] += time.perf_counter() - phase_started
 
-        phase_started = time.perf_counter()
         dist.barrier()
-        self._phase_times["group_barrier"] += time.perf_counter() - phase_started
-        if self.world.is_master:
-            self.logger.debug(
-                f"NIXL push policy v{step} group {self.transfer_group_names[group_index]} transferred in "
-                f"{time.perf_counter() - started:.2f}s"
-            )
 
-    def _broadcast_single_buffer(self, step: int) -> None:
+    def _broadcast_single_buffer(self) -> None:
         for group_index in range(len(self.transfer_group_names)):
             if group_index:
-                phase_started = time.perf_counter()
                 self.finish_staging_buffer_transfer(group_index - 1)
-                self._phase_times["buffer_reuse"] += time.perf_counter() - phase_started
-            self._transfer_group(group_index, step)
+            self._transfer_group(group_index)
         if self.transfer_group_names:
-            phase_started = time.perf_counter()
             self.finish_staging_buffer_transfer(len(self.transfer_group_names) - 1)
-            self._phase_times["buffer_reuse"] += time.perf_counter() - phase_started
 
-    def _broadcast_buffer_ring(self, step: int) -> None:
+    def _broadcast_buffer_ring(self) -> None:
         for group_index in range(len(self.transfer_group_names)):
             next_group = group_index + 1
             reused_group = (
@@ -232,39 +207,23 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
                 if next_group >= self.staging_buffer_count
                 else None
             )
-            self._transfer_group(group_index, step, reused_group)
+            self._transfer_group(group_index, reused_group)
 
         first_pending_group = max(
             0,
             len(self.transfer_group_names) - self.staging_buffer_count + 1,
         )
         for group_index in range(first_pending_group, len(self.transfer_group_names)):
-            phase_started = time.perf_counter()
             self.finish_staging_buffer_transfer(group_index)
-            self._phase_times["buffer_reuse"] += time.perf_counter() - phase_started
 
     @torch.no_grad()
     def broadcast_weights(self, model: nn.Module, step: int) -> None:
         self.initialize_transfer(model)
-        start = time.perf_counter()
-
-        self._phase_times: defaultdict[str, float] = defaultdict(float)
-        phase_started = time.perf_counter()
         self._begin_update()
-        self._phase_times["begin_update"] = time.perf_counter() - phase_started
 
         if self.staging_buffer_count == 1:
-            self._broadcast_single_buffer(step)
+            self._broadcast_single_buffer()
         else:
-            self._broadcast_buffer_ring(step)
+            self._broadcast_buffer_ring()
 
-        phase_started = time.perf_counter()
         self._finish_update()
-        self._phase_times["finish_update"] = time.perf_counter() - phase_started
-        total = time.perf_counter() - start
-        phases = " ".join(f"{name}={value:.4f}s" for name, value in self._phase_times.items())
-        self.logger.info(
-            f"NIXL push policy v{step} phases: total={total:.4f}s groups={len(self.transfer_group_names)} "
-            f"buffers={self.staging_buffer_count} {phases}"
-        )
-        self.logger.info(f"NIXL push policy v{step} synchronized in {total:.2f}s")
