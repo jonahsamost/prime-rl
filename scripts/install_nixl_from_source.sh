@@ -83,14 +83,28 @@ fi
 cd "$NIXL_SRC"
 git checkout "$NIXL_VERSION"
 
+if [ "$NIXL_VERSION" = "0.10.1" ]; then
+    NIXL_PATCH="$PROJECT_DIR/patches/nixl/0.10.1-ucx-only.patch"
+    if git apply --reverse --check "$NIXL_PATCH" >/dev/null 2>&1; then
+        echo "=== NIXL UCX-only patch already applied ==="
+    else
+        git apply "$NIXL_PATCH"
+    fi
+fi
+
 export PKG_CONFIG_PATH="$UCX_INSTALL/lib/pkgconfig"
 export LD_LIBRARY_PATH="$UCX_INSTALL/lib:$UCX_INSTALL/lib/ucx:${LD_LIBRARY_PATH:-}"
 
-# Build and install directly (no auditwheel) so NIXL links to our UCX at runtime
+# Build only the UCX plugin. Auto-detection can otherwise enable unrelated
+# plugins from runtime libraries whose development headers are not installed.
+# Install directly (no auditwheel) so NIXL links to our UCX at runtime.
 WHEEL_DIR="$PROJECT_DIR/deps"
 mkdir -p "$WHEEL_DIR"
 uv pip install pip 2>/dev/null
-"$PYTHON" -m pip wheel . --no-deps --wheel-dir="$WHEEL_DIR"
+"$PYTHON" -m pip wheel . \
+    --no-deps \
+    --wheel-dir="$WHEEL_DIR" \
+    --config-settings=setup-args="-Denable_plugins=UCX"
 
-WHEEL=$(ls "$WHEEL_DIR"/nixl*.whl | head -1)
+WHEEL=$(ls -t "$WHEEL_DIR"/nixl*.whl | head -1)
 echo "=== NIXL wheel built at: $WHEEL ==="

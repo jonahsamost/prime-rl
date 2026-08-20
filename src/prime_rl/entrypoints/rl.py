@@ -200,6 +200,42 @@ def rl_local(config: RLConfig):
     signal.signal(signal.SIGTERM, sigterm_handler)
 
     try:
+        # Local NIXL runs own their ModelExpress rendezvous service. Remote hosts are
+        # externally managed so multi-node deployments can share one server.
+        if config.weight_broadcast.type == "nixl" and config.weight_broadcast.host in {
+            "localhost",
+            "127.0.0.1",
+            "::1",
+        }:
+            metadata_host = (
+                "127.0.0.1" if config.weight_broadcast.host == "localhost" else config.weight_broadcast.host
+            )
+            metadata_cmd = [
+                sys.executable,
+                "-m",
+                "prime_rl.trainer.rl.broadcast.nixl.metadata_server",
+                "--host",
+                metadata_host,
+                "--port",
+                str(config.weight_broadcast.port),
+            ]
+            logger.info(
+                f"Starting local ModelExpress metadata server on {metadata_host}:{config.weight_broadcast.port}"
+            )
+            with open(log_dir / "model_express.log", "w") as log_file:
+                metadata_process = Popen(metadata_cmd, stdout=log_file, stderr=log_file)
+            processes.append(metadata_process)
+
+            stop_event = Event()
+            stop_events["model_express"] = stop_event
+            monitor_thread = Thread(
+                target=monitor_process,
+                args=(metadata_process, stop_event, error_queue, "ModelExpress metadata server"),
+                daemon=True,
+            )
+            monitor_thread.start()
+            monitor_threads.append(monitor_thread)
+
         # Optionally, start inference process
         if config.inference:
             inference_cmd = ["inference", "@", (config_dir / INFERENCE_CONFIG).as_posix()]
