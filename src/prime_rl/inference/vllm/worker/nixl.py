@@ -79,7 +79,10 @@ class WeightTransferPlan:
 
 
 class NIXLWeightUpdateWorker(Worker):
-    # Whether a buffer can be reused before applying its weights.
+    # In pull mode, the ack protects a trainer-owned source buffer,
+    #   which is no longer needed once the read completes.
+    # In push mode, it protects an inference-owned destination buffer,
+    #   which remains needed until replay completes.
     ack_before_replay = True
 
     @property

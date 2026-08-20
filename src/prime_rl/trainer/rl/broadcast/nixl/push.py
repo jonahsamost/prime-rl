@@ -33,12 +33,12 @@ class PendingWrite:
 
 
 class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
-    """Push canonical FSDP shards into inference-owned staging buffers."""
+    """Push shards into inference-owned staging buffers."""
 
     def choose_staging_buffer_count(self, largest_group_bytes: int) -> int:
         requested = self.config.push_buffer_count
         target_count = min(
-            2 if requested == "auto" else requested,
+            4 if requested == "auto" else requested,
             len(self.transfer_group_names),
         )
         local_count = target_count
@@ -134,17 +134,16 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
     def stage_group(self, group_index: int) -> None:
         if not self.is_serving_rank:
             return
-        # Preserve the optimizer/default-stream happens-before relationship
-        # when moving staging copies onto their own stream.
+        # Staging uses a separate stream from the optimizer, so wait until the
+        # parameter updates have finished before copying the weights.
         self.staging_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.staging_stream):
             for shard in self.staged_shards_by_group.get(group_index, ()):
                 shard.copy_to_staging()
             staged = torch.cuda.Event()
             staged.record(self.staging_stream)
-        # NIXL is not ordered against PyTorch streams. Only wait for this
-        # group's copies; a device-wide synchronize would also stall unrelated
-        # trainer CUDA work.
+        # UCX is not ordered with PyTorch CUDA streams, so ensure these copies
+        # finish before post_group_writes asks UCX to read the staging buffers.
         staged.synchronize()
 
     def post_group_writes(self, group_index: int) -> list[PendingWrite]:
@@ -183,14 +182,15 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
         self._group_generations[group_index] += 1
 
     def _transfer_group(self, group_index: int) -> list[PendingWrite]:
+        # stage and post a group, but don't wait for write to complete
         self.stage_group(group_index)
         pending = self.post_group_writes(group_index)
         dist.barrier()
         return pending
 
     def _finish_group_transfer(self, group_index: int, pending: list[PendingWrite]) -> None:
-        self.finish_group_writes(group_index, pending)
-        self.finish_staging_buffer_transfer(group_index)
+        self.finish_group_writes(group_index, pending)  # ucx write has completed
+        self.finish_staging_buffer_transfer(group_index)  # inference replayed and acknowledged
 
     def _broadcast_buffer_ring(self) -> None:
         outstanding: deque[tuple[int, list[PendingWrite]]] = deque()
@@ -206,7 +206,5 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
     def broadcast_weights(self, model: nn.Module, step: int) -> None:
         self.initialize_transfer(model)
         self._begin_update()
-
         self._broadcast_buffer_ring()
-
         self._finish_update()
