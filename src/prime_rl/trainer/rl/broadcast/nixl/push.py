@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from typing import Any
 
@@ -181,49 +182,31 @@ class NIXLPushWeightBroadcast(NIXLWeightBroadcast):
             self.nixl_agent.wait_for_notifications(expected, timeout=self.config.timeout)
         self._group_generations[group_index] += 1
 
-    def _transfer_group(self, group_index: int, reused_group: int | None = None) -> None:
+    def _transfer_group(self, group_index: int) -> list[PendingWrite]:
         self.stage_group(group_index)
         pending = self.post_group_writes(group_index)
-        self.finish_group_writes(group_index, pending)
-
-        if reused_group is not None:
-            self.finish_staging_buffer_transfer(reused_group)
-
         dist.barrier()
+        return pending
 
-    def _broadcast_single_buffer(self) -> None:
-        for group_index in range(len(self.transfer_group_names)):
-            if group_index:
-                self.finish_staging_buffer_transfer(group_index - 1)
-            self._transfer_group(group_index)
-        if self.transfer_group_names:
-            self.finish_staging_buffer_transfer(len(self.transfer_group_names) - 1)
+    def _finish_group_transfer(self, group_index: int, pending: list[PendingWrite]) -> None:
+        self.finish_group_writes(group_index, pending)
+        self.finish_staging_buffer_transfer(group_index)
 
     def _broadcast_buffer_ring(self) -> None:
+        outstanding: deque[tuple[int, list[PendingWrite]]] = deque()
         for group_index in range(len(self.transfer_group_names)):
-            next_group = group_index + 1
-            reused_group = (
-                next_group - self.staging_buffer_count
-                if next_group >= self.staging_buffer_count
-                else None
-            )
-            self._transfer_group(group_index, reused_group)
+            if len(outstanding) == self.staging_buffer_count:
+                self._finish_group_transfer(*outstanding.popleft())
+            outstanding.append((group_index, self._transfer_group(group_index)))
 
-        first_pending_group = max(
-            0,
-            len(self.transfer_group_names) - self.staging_buffer_count + 1,
-        )
-        for group_index in range(first_pending_group, len(self.transfer_group_names)):
-            self.finish_staging_buffer_transfer(group_index)
+        while outstanding:
+            self._finish_group_transfer(*outstanding.popleft())
 
     @torch.no_grad()
     def broadcast_weights(self, model: nn.Module, step: int) -> None:
         self.initialize_transfer(model)
         self._begin_update()
 
-        if self.staging_buffer_count == 1:
-            self._broadcast_single_buffer()
-        else:
-            self._broadcast_buffer_ring()
+        self._broadcast_buffer_ring()
 
         self._finish_update()

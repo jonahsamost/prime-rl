@@ -160,22 +160,22 @@ def test_push_pipeline_waits_for_previous_replay_before_reusing_slot(monkeypatch
     assert events[:5] == [
         "stage:0",
         "post:0",
-        "finish:0",
         "stage:1",
         "post:1",
+        "finish:0",
     ]
     assert events == [
         "stage:0",
         "post:0",
-        "finish:0",
         "stage:1",
         "post:1",
-        "finish:1",
+        "finish:0",
         "reuse:0",
         "stage:2",
         "post:2",
-        "finish:2",
+        "finish:1",
         "reuse:1",
+        "finish:2",
         "reuse:2",
     ]
 
