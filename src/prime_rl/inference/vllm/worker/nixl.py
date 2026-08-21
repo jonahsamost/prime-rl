@@ -79,10 +79,10 @@ class WeightTransferPlan:
 
 
 class NIXLWeightUpdateWorker(Worker):
-    # In pull mode, the ack protects a trainer-owned source buffer,
-    #   which is no longer needed once the read completes.
-    # In push mode, it protects an inference-owned destination buffer,
-    #   which remains needed until replay completes.
+    # In pull mode, the acknowledgment protects a trainer-owned source buffer,
+    # which can be reused once the read completes.
+    # In push mode, it protects an inference-owned destination buffer, which
+    # cannot be reused until its weights have been applied to the vLLM model.
     ack_before_replay = True
 
     @property
